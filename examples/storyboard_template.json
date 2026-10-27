@@ -1,0 +1,86 @@
+{
+  "title": "AI_Movie_Demo",
+  "aspect_ratio": "16:9",
+  "width": 1280,
+  "height": 720,
+  "fps": 24,
+  "sample_rate": 48000,
+  "audio_mode": "native_h3_audio",
+  "continuity_mode": "hybrid",
+  "inference_mode": "reference",
+  "ref_image_size": "max",
+  "tail_guard_sec": 0.35,
+  "cfg": 4.0,
+  "steps": 8,
+  "characters": {
+    "learner": {
+      "name": "年輕女性學員",
+      "description": "二十多歲台灣女性，馬尾髮型，淺藍色整潔工作服，神情專注自然",
+      "image_path": "char_learner.png",
+      "screen_position": "畫面左側"
+    },
+    "mentor": {
+      "name": "資深男性導師",
+      "description": "四十多歲台灣男性，短髮戴細框眼鏡，白色外套，神情沉穩溫和",
+      "image_path": "char_mentor.png",
+      "screen_position": "畫面右側"
+    }
+  },
+  "scenes": {
+    "station": {
+      "description": "明亮整潔的現代教學討論空間，木質桌面與柔和自然窗光，色溫恆定",
+      "image_path": "scene_anchor.png",
+      "axis_rule": "嚴格維持 180 度軸線，學員固定於畫面左側、導師固定於畫面右側，禁止站位對調與背景跳變"
+    }
+  },
+  "shots": [
+    {
+      "shot_id": "01_opening",
+      "index": 1,
+      "scene_id": "station",
+      "duration_sec": 8.0,
+      "visual_prompt": "左側學員手持紀錄板專注報告，右側導師微笑點頭傾聽，雙人站位穩定、眼神自然交流。",
+      "camera_motion": "固定雙人中景鏡位，保持構圖與光影穩定",
+      "dialogue": "大家好，今天我們用一分鐘的時間，帶大家掌握結構化交班的四個核心步驟。",
+      "subtitle_text": "今天帶大家掌握結構化交班的四個核心步驟",
+      "characters": ["learner", "mentor"],
+      "seed": 1001
+    },
+    {
+      "shot_id": "02_situation",
+      "index": 2,
+      "scene_id": "station",
+      "duration_sec": 10.0,
+      "visual_prompt": "延續上一鏡姿勢與構圖，左側學員翻開紀錄表指出重點，右側導師看著紀錄表點頭肯定。",
+      "camera_motion": "極緩慢推鏡至中近景，嚴禁跳軸",
+      "dialogue": "第一步是說明目前狀況與關鍵背景，讓接手團隊在最短時間內抓到重點。",
+      "subtitle_text": "第一步：說明目前狀況與關鍵背景，讓團隊快速抓到重點",
+      "characters": ["learner", "mentor"],
+      "seed": 1002
+    },
+    {
+      "shot_id": "03_assessment",
+      "index": 3,
+      "scene_id": "station",
+      "duration_sec": 10.0,
+      "visual_prompt": "左側學員條理分明地比出兩個重點手勢，表情沉穩自信；右側導師在旁紀錄並微笑回應。",
+      "camera_motion": "固定雙人中景，背景與光影一致",
+      "dialogue": "第二步是提出精準評估與具體建議，明確告訴團隊接下來需要配合的處置方向。",
+      "subtitle_text": "第二步：提出精準評估與具體建議，明確說明處置方向",
+      "characters": ["learner", "mentor"],
+      "seed": 1003
+    },
+    {
+      "shot_id": "04_closing",
+      "index": 4,
+      "scene_id": "station",
+      "duration_sec": 8.0,
+      "visual_prompt": "雙人完成交班，學員合上紀錄板，導師比出讚許手勢，兩人同時面向鏡頭自然微笑收尾。",
+      "camera_motion": "固定穩定中景，平穩收尾",
+      "dialogue": "掌握結構、穩定表達，就能讓每一次團隊溝通既安全又高效率！",
+      "subtitle_text": "掌握結構、穩定表達，讓團隊溝通既安全又高效率！",
+      "characters": ["learner", "mentor"],
+      "seed": 1004
+    }
+  ]
+}
