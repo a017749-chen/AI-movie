@@ -1,50 +1,79 @@
-"""Unified Storyboard & Script Loader for AI-Movie (Colab MiniMax H3 + autoip-mv-maker).
+"""Storyboard loader and MiniMax H3 prompt builder.
 
-Accepts user storyboards in any of three formats:
-1. Markdown storyboard (`.md`): Markdown tables (`| 鏡號 | 秒數 | 畫面 | 旁白/台詞 | 字幕 | 參考圖 |`)
-   or heading blocks (`### 01_identify ...`).
-2. JSON storyboard (`.json`): `scenes.json`, `shotlist.json`, or unified `storyboard.json`.
-3. Python MV project (`project.py` or project directory): native `autoip-mv-maker` format.
+Input formats (all become one `StoryboardProject`):
+  * Markdown table (`.md`)       | 鏡號 | 秒數 | 場景 | 角色 | 畫面 | 運鏡 | 旁白 | 字幕 | 參考圖 |
+  * JSON (`.json`)               storyboard_template.json, scenes.json, shotlist.json
+  * autoip-mv-maker `project.py` CHARS / BROLL / BAND / LS_SCENES / SECTIONS
 
-Solves two core production issues:
-- Visual Continuity ("畫面跑掉、不連貫"):
-  Locks `<Picture 1>` (scene/camera axis anchor) + `<Picture 2..N>` (character sheets),
-  compiles structured `subject_definitions` + `retention_analysis` anti-drift blocks,
-  and configures frame-chaining (`anchor` | `hybrid` | `chain_last_frame`) + `tail_guard`.
-- Single Audio Track ("只要有一個聲軌就好"):
-  Enforces mutually exclusive `audio_mode` (`native_h3_audio` | `clip_voiceover` | `master_audio`)
-  both at prompt-generation time (preventing H3 from generating competing speech when external
-  voiceover/master audio is used) and at FFmpeg muxing time.
+Each storyboard row is generated as ONE H3 clip (5-15 s). Continuity between clips comes from
+(1) a fixed picture plan (`<Picture 1>` = scene/start frame, `<Picture 2..>` = character sheets, Ref2VA only)
+and (2) optional last-frame chaining done by `h3_colab_runner`.
+
+Prompts follow the format used by the upstream MiniMax_H3_Turbo_Colab notebook and the ISBAR prompts that
+worked in practice:
+
+    For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
+    integrated_multimodal_description: [Shot 1] ...
+    overall_soundscape: ...
+    non_diegetic_music: N/A
+
+Audio policy (`audio_mode`) decides what the prompt asks H3 to voice, so the model never produces a voice that
+post-production will later stack a second voice on top of:
+  * native_h3_audio : H3 speaks the line in `<d>[Chinese] ...</d>`; that audio is the only track kept.
+  * clip_voiceover  : H3 is told nobody speaks; its audio is replaced by one WAV per shot.
+  * master_audio    : H3 is told nobody speaks; all clip audio is dropped and one master track is laid under.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
+import math
 import os
 import re
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 VALID_AUDIO_MODES = ("native_h3_audio", "clip_voiceover", "master_audio")
-VALID_CONTINUITY_MODES = ("anchor", "hybrid", "chain_last_frame")
-VALID_INFERENCE_MODES = ("reference", "first_frame", "text_only")
+VALID_CONTINUITY_MODES = ("hybrid", "chain_last_frame", "anchor")
+VALID_INFERENCE_MODES = ("reference", "first_frame")
+
+H3_FPS = 24
+H3_MAX_AREA = 1344 * 768
+H3_MIN_SECONDS = 4.0
+H3_MAX_SECONDS = 15.0
+H3_STABLE_MIN_SECONDS = 5.0          # ~124 frames, lower edge of the trained range
+MAX_REFERENCE_IMAGES = 9
+
+ASPECT_PRESETS = {
+    "16:9": (1344, 768),
+    "9:16": (768, 1344),
+    "1:1": (992, 992),
+}
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def h3_frames(seconds: float) -> int:
+    """Frame count ComfyUI's H3 nodes accept for a requested duration (24 fps, aligned to 17k+5)."""
+    requested = max(5, round(seconds * H3_FPS))
+    return requested + (5 - requested % 17) % 17
 
 
 @dataclass
 class CharacterSpec:
     id: str
     name: str
-    description: str
+    description: str = ""
     image_path: str = ""
-    screen_position: str = ""  # e.g., "畫面左側", "畫面右側", "畫面中央"
+    screen_position: str = ""        # e.g. "left side of frame"
 
 
 @dataclass
 class SceneAnchorSpec:
     id: str
-    description: str
+    description: str = ""
     image_path: str = ""
-    axis_rule: str = "維持 180 度軸線一致，角色左右站位不可對調，背景陳設與光線色溫保持恆定"
 
 
 @dataclass
@@ -53,645 +82,507 @@ class ShotSpec:
     index: int
     title: str = ""
     scene_id: str = "default"
-    duration_sec: float = 6.0
-    start_sec: float = 0.0
-    end_sec: float = 6.0
+    duration_sec: float = 6.0         # length kept in the final cut
     visual_prompt: str = ""
-    camera_motion: str = "固定鏡位或極緩慢推鏡，禁止劇烈晃動與突然變焦"
-    dialogue: str = ""          # Spoken dialogue / narration text
-    dialogue_lang: str = "Chinese"
-    subtitle_text: str = ""     # Text to display in subtitles (defaults to dialogue if empty)
+    camera_motion: str = ""
+    dialogue: str = ""                # spoken text (Traditional Chinese)
+    speaker: str = ""                 # empty = the project narrator (off screen)
+    subtitle_text: str = ""           # defaults to dialogue
     characters: List[str] = field(default_factory=list)
-    reference_images: List[str] = field(default_factory=list)
-    first_frame_image: str = ""
-    narration_wav: str = ""
-    seed: int = 1001
-    continuity_override: str = ""  # Optional per-shot override: "anchor" | "chain_last_frame"
-    compiled_h3_prompt: str = ""
+    reference_images: List[str] = field(default_factory=list)   # explicit picture list overrides the plan
+    narration_wav: str = ""           # clip_voiceover mode
+    seed: int = 0
+    continuity_override: str = ""     # "anchor" | "chain_last_frame" for this shot only
     notes: str = ""
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+
+@dataclass
+class PictureRef:
+    path: str
+    role: str                         # "scene" | "character" | "chain" | "extra"
+    label: str                        # sentence used in the prompt
 
 
 @dataclass
 class StoryboardProject:
-    title: str = "AI_Movie_Project"
+    title: str = "AI_Movie"
     aspect_ratio: str = "16:9"
-    width: int = 1280
-    height: int = 720
-    fps: int = 24
+    width: int = 1344
+    height: int = 768
     sample_rate: int = 48000
-    audio_mode: str = "native_h3_audio"      # "native_h3_audio" | "clip_voiceover" | "master_audio"
-    continuity_mode: str = "hybrid"          # "anchor" | "hybrid" | "chain_last_frame"
-    inference_mode: str = "reference"        # "reference" (Ref2VA) | "first_frame" (FL2VA) | "text_only"
-    ref_image_size: str = "max"              # "max" (up to 2048px, best identity lock) | "match"
-    tail_guard_sec: float = 0.35             # Trim unstable tail frames from raw generation
-    cfg: float = 4.0
-    steps: int = 8
+    audio_mode: str = "native_h3_audio"
+    continuity_mode: str = "hybrid"
+    inference_mode: str = "reference"
+    ref_image_size: str = "max"
+    tail_guard_sec: float = 0.35
+    base_seed: int = 768914106098754
     master_audio_path: str = ""
     style_prefix: str = (
-        "寫實電影級畫面，自然柔和環境光，五官清晰穩定，肢體動作自然流暢，攝影機運動平穩，"
-        "嚴格保持人物臉部特徵、髮型、服裝與空間軸線連貫一致。"
+        "Photorealistic cinematic film, natural soft light, stable faces, natural body movement, "
+        "restrained camera motion."
+    )
+    continuity_rules: str = (
+        "Keep every person's face, hairstyle, clothing and props, the room layout, screen positions and "
+        "lighting exactly consistent with the reference pictures."
     )
     negative_rules: str = (
-        "禁止畫面閃爍、禁止人物五官變形或換臉、禁止角色左右位置跳動、禁止多手多指、"
-        "禁止背景無故切換、禁止出現任何浮水印或畫面內嵌文字。"
+        "No flicker, no face changes, no extra people, anatomically correct hands, "
+        "no captions, no logos, no generated text or watermarks."
     )
+    narrator: str = "A calm female off-screen narrator (S1) speaks in clear Taiwan Mandarin at a measured pace"
+    overall_soundscape: str = "Quiet indoor room tone with soft natural movement sounds."
     characters: Dict[str, CharacterSpec] = field(default_factory=dict)
     scenes: Dict[str, SceneAnchorSpec] = field(default_factory=dict)
     shots: List[ShotSpec] = field(default_factory=list)
+    subtitle_cues: List[Tuple[float, float, str]] = field(default_factory=list)  # absolute timings (MV lyrics)
+
+    # ------------------------------------------------------------------ settings
+    def set_aspect(self, aspect: str) -> None:
+        if aspect not in ASPECT_PRESETS:
+            raise ValueError(f"aspect_ratio must be one of {sorted(ASPECT_PRESETS)}")
+        self.aspect_ratio = aspect
+        self.width, self.height = ASPECT_PRESETS[aspect]
+
+    def generation_seconds(self, shot: ShotSpec) -> float:
+        """Requested H3 length: the kept length plus the tail that gets trimmed, never below 5 s."""
+        return min(H3_MAX_SECONDS, max(H3_STABLE_MIN_SECONDS, shot.duration_sec + self.tail_guard_sec))
 
     def validate(self) -> None:
+        errors: List[str] = []
         if self.audio_mode not in VALID_AUDIO_MODES:
-            raise ValueError(f"Invalid audio_mode={self.audio_mode!r}; must be one of {VALID_AUDIO_MODES}")
+            errors.append(f"audio_mode={self.audio_mode!r} must be one of {VALID_AUDIO_MODES}")
         if self.continuity_mode not in VALID_CONTINUITY_MODES:
-            raise ValueError(f"Invalid continuity_mode={self.continuity_mode!r}; must be one of {VALID_CONTINUITY_MODES}")
+            errors.append(f"continuity_mode={self.continuity_mode!r} must be one of {VALID_CONTINUITY_MODES}")
         if self.inference_mode not in VALID_INFERENCE_MODES:
-            raise ValueError(f"Invalid inference_mode={self.inference_mode!r}; must be one of {VALID_INFERENCE_MODES}")
+            errors.append(f"inference_mode={self.inference_mode!r} must be one of {VALID_INFERENCE_MODES}")
+        if self.ref_image_size not in ("max", "match"):
+            errors.append("ref_image_size must be 'max' or 'match'")
+        if self.width % 32 or self.height % 32 or self.width * self.height > H3_MAX_AREA:
+            errors.append(f"{self.width}x{self.height}: width/height must be multiples of 32, area <= 1344x768")
+        if not 0 <= self.tail_guard_sec <= 1.0:
+            errors.append("tail_guard_sec should be between 0 and 1 second")
+        if not self.shots:
+            errors.append("storyboard has no shots")
+        longest = H3_MAX_SECONDS - self.tail_guard_sec
+        seen = set()
+        for s in self.shots:
+            if s.shot_id in seen:
+                errors.append(f"duplicate shot id {s.shot_id!r}")
+            seen.add(s.shot_id)
+            if not s.visual_prompt.strip():
+                errors.append(f"shot {s.shot_id}: empty visual description")
+            if s.duration_sec <= 0:
+                errors.append(f"shot {s.shot_id}: duration must be > 0")
+            if s.duration_sec > longest + 1e-6:
+                errors.append(
+                    f"shot {s.shot_id}: {s.duration_sec:.2f}s is longer than one H3 clip allows "
+                    f"({longest:.2f}s after the {self.tail_guard_sec}s tail guard) - split it into two rows")
+            if s.continuity_override and s.continuity_override not in ("anchor", "chain_last_frame"):
+                errors.append(f"shot {s.shot_id}: continuity_override must be 'anchor' or 'chain_last_frame'")
+        if errors:
+            raise ValueError("Storyboard problems:\n  - " + "\n  - ".join(errors))
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "title": self.title,
-            "aspect_ratio": self.aspect_ratio,
-            "width": self.width,
-            "height": self.height,
-            "fps": self.fps,
-            "sample_rate": self.sample_rate,
-            "audio_mode": self.audio_mode,
-            "continuity_mode": self.continuity_mode,
-            "inference_mode": self.inference_mode,
-            "ref_image_size": self.ref_image_size,
-            "tail_guard_sec": self.tail_guard_sec,
-            "cfg": self.cfg,
-            "steps": self.steps,
-            "master_audio_path": self.master_audio_path,
-            "style_prefix": self.style_prefix,
-            "negative_rules": self.negative_rules,
-            "characters": {k: asdict(v) for k, v in self.characters.items()},
-            "scenes": {k: asdict(v) for k, v in self.scenes.items()},
-            "shots": [s.to_dict() for s in self.shots],
-        }
+        d = asdict(self)
+        return d
 
 
-def _clean_dialogue_tags(text: str) -> str:
-    """Strip any existing `<d>...</d>` wrapper and return clean spoken text."""
+# ---------------------------------------------------------------------- helpers
+def clean_dialogue(text: str) -> str:
+    """Strip `<d>[Lang] ... </d>` wrappers and quotes, keep the spoken words."""
     if not text:
         return ""
-    cleaned = re.sub(r"<d>\s*(?:\[[A-Za-z\-]+\]\s*)?", "", text, flags=re.IGNORECASE)
-    cleaned = re.sub(r"</d>", "", cleaned, flags=re.IGNORECASE)
-    return cleaned.strip()
+    t = re.sub(r"<d>\s*(?:\[[A-Za-z\-]+\]\s*)?", "", text, flags=re.I)
+    t = re.sub(r"</d>", "", t, flags=re.I)
+    return t.strip().strip("「」\"'“” ").strip()
 
 
-def compile_shot_prompt(project: StoryboardProject, shot: ShotSpec) -> str:
-    """Compile a structured, anti-drift MiniMax H3 prompt with `<Picture k>` bindings and single-audio rules."""
-    project.validate()
+# kept for backwards compatibility with earlier imports
+_clean_dialogue_tags = clean_dialogue
 
-    # Determine bound reference pictures:
-    # <Picture 1> is always the scene anchor (or chained frame from previous shot in same scene)
-    # <Picture 2..N> are character reference sheets
-    pic_bindings: List[str] = []
-    scene_spec = project.scenes.get(shot.scene_id) or next(iter(project.scenes.values()), None)
 
-    pic_idx = 1
-    if project.inference_mode == "reference":
-        if scene_spec and (scene_spec.description or scene_spec.image_path):
-            pic_bindings.append(
-                f"- <Picture {pic_idx}>：場景與鏡位基準圖（{scene_spec.description}；{scene_spec.axis_rule}）。"
-            )
-            pic_idx += 1
-        elif shot.reference_images:
-            pic_bindings.append(
-                f"- <Picture {pic_idx}>：主場景與角色站位基準圖（嚴格維持此構圖軸線、背景與光影色溫）。"
-            )
-            pic_idx += 1
+def _resolve_path(p: str, base_dirs: List[Path]) -> str:
+    if not p:
+        return ""
+    cand = Path(p)
+    if cand.is_absolute():
+        return str(cand)
+    for b in base_dirs:
+        if b and (b / cand).exists():
+            return str((b / cand).resolve())
+    return p
 
+
+def shot_picture_plan(project: StoryboardProject, shot: ShotSpec,
+                      base_dirs: Optional[List[Path]] = None) -> List[PictureRef]:
+    """Ordered pictures for a shot: <Picture 1> scene/start frame, then character sheets (Ref2VA only).
+
+    Missing files are dropped here so the prompt never mentions a picture the graph does not receive.
+    """
+    base_dirs = [Path(b) for b in (base_dirs or []) if b]
+    plan: List[PictureRef] = []
+    scene = project.scenes.get(shot.scene_id) or project.scenes.get("default")
+
+    def exists(p: str) -> bool:
+        return bool(p) and Path(p).is_file()
+
+    if shot.reference_images:
+        char_by_file = {Path(c.image_path).name: c for c in project.characters.values() if c.image_path}
+        for i, raw in enumerate(shot.reference_images):
+            p = _resolve_path(raw, base_dirs)
+            if not exists(p):
+                continue
+            ch = char_by_file.get(Path(p).name)
+            if ch:
+                plan.append(PictureRef(p, "character", _character_label(ch)))
+            elif not plan:
+                plan.append(PictureRef(p, "scene", "the scene, people and composition"))
+            else:
+                plan.append(PictureRef(p, "extra", "an additional visual reference"))
+    else:
+        if scene and exists(_resolve_path(scene.image_path, base_dirs)):
+            desc = scene.description or "the scene"
+            plan.append(PictureRef(_resolve_path(scene.image_path, base_dirs), "scene",
+                                   f"the scene and composition ({desc})"))
+        for cid in shot.characters:
+            ch = project.characters.get(cid)
+            if ch and exists(_resolve_path(ch.image_path, base_dirs)):
+                plan.append(PictureRef(_resolve_path(ch.image_path, base_dirs), "character", _character_label(ch)))
+
+    if project.inference_mode == "first_frame":
+        plan = plan[:1]
+    return plan[:MAX_REFERENCE_IMAGES]
+
+
+def _character_label(ch: CharacterSpec) -> str:
+    bits = [ch.name]
+    if ch.description:
+        bits.append(ch.description)
+    if ch.screen_position:
+        bits.append(f"always on the {ch.screen_position}")
+    return ", ".join(bits)
+
+
+def build_h3_prompt(project: StoryboardProject, shot: ShotSpec, pictures: List[PictureRef]) -> str:
+    """Compose the full H3 prompt for one clip. `pictures` must be the exact list fed to the graph."""
+    seconds = project.generation_seconds(shot)
+    lines: List[str] = []
+
+    if pictures:
+        lines.append("For the target video, at 0.00 seconds into the target video, "
+                     "<Picture 1> (from [Shot 1]) is fully referenced.")
+        if len(pictures) > 1:
+            refs = []
+            for n, pic in enumerate(pictures[1:], start=2):
+                refs.append(f"<Picture {n}> shows {pic.label}; keep this person's face, hair and clothing identical.")
+            lines.append(" ".join(refs))
+        lines.append("")
+
+    body: List[str] = [project.style_prefix.strip()]
+    scene = project.scenes.get(shot.scene_id) or project.scenes.get("default")
+    if scene and scene.description:
+        body.append(f"Setting: {scene.description}.")
+    if project.inference_mode == "first_frame" or len(pictures) <= 1:
+        # characters have no picture of their own: describe them in words
         for cid in shot.characters:
             ch = project.characters.get(cid)
             if ch:
-                pos_note = f"，固定於{ch.screen_position}" if ch.screen_position else ""
-                pic_bindings.append(
-                    f"- <Picture {pic_idx}>：{ch.name}（{ch.description}{pos_note}，臉部五官、髮型與服裝須與參考圖完全一致）。"
-                )
-                pic_idx += 1
-
-    # Audio instruction strictly follows project.audio_mode so two voices NEVER overlap
-    clean_spoken = _clean_dialogue_tags(shot.dialogue)
-    if project.audio_mode == "native_h3_audio":
-        if clean_spoken:
-            audio_block = (
-                f"【單一聲軌規範（原生語音）】僅允許單一清晰人聲唸出以下台詞，禁止背景音樂、禁止重疊第二人聲或雜音：\n"
-                f"<d>[{shot.dialogue_lang}] {clean_spoken}</d>"
-            )
-        else:
-            audio_block = (
-                "【單一聲軌規範（純環境音）】本鏡頭無台詞對白，人物嘴部保持自然閉合，僅保留極輕微自然的單一環境底噪，禁止人聲與音樂。"
-            )
-    elif project.audio_mode == "clip_voiceover":
-        audio_block = (
-            "【單一聲軌規範（外部旁白替換模式）】本鏡頭音軌將於後製由外部單一旁白音檔完全替換。"
-            "生成時禁止發出任何說話人聲、禁止背景音樂，人物聚焦於肢體與表情演出，避免嘴型與外部旁白衝突。"
-        )
-    else:  # master_audio
-        audio_block = (
-            "【單一聲軌規範（主音軌對齊模式）】最終影片僅使用單一主音軌（Master Audio），"
-            "生成片段之原生音軌將以 -an 完全移除，請專注於畫面視覺連貫性與節奏。"
-        )
-
-    parts: List[str] = [f"【風格與連貫性總則】{project.style_prefix}"]
-    if pic_bindings:
-        parts.append("【參考圖綁定 (Subject & Scene Lock)】\n" + "\n".join(pic_bindings))
-    if scene_spec:
-        parts.append(f"【場景軸線鎖定】{scene_spec.description}。{scene_spec.axis_rule}。")
-    parts.append(f"【本鏡動作與構圖（鏡頭 {shot.shot_id}，{shot.duration_sec:.1f} 秒）】{shot.visual_prompt}")
+                body.append(f"{_character_label(ch)}.")
+    body.append(shot.visual_prompt.strip().rstrip("。.") + ".")
     if shot.camera_motion:
-        parts.append(f"【運鏡規範】{shot.camera_motion}")
-    parts.append(audio_block)
-    parts.append(f"【防跑掉與負面限制 (Retention & Anti-Drift)】{project.negative_rules}")
+        body.append(f"Camera: {shot.camera_motion.strip().rstrip('。.')}.")
+    if pictures:
+        body.append(project.continuity_rules)
 
-    prompt = "\n".join(p for p in parts if p.strip())
-    shot.compiled_h3_prompt = prompt
+    spoken = clean_dialogue(shot.dialogue)
+    if project.audio_mode == "native_h3_audio" and spoken:
+        finish = max(1.5, seconds - 1.0)
+        if shot.speaker:
+            body.append(f"{shot.speaker} says, starting at 0.4 seconds and finishing by {finish:.1f} seconds: "
+                        f"<d>[Chinese] {spoken}</d> Nobody else speaks.")
+        else:
+            body.append(f"{project.narrator}, starting at 0.4 seconds and finishing by {finish:.1f} seconds: "
+                        f"<d>[Chinese] {spoken}</d> The on-screen people do not speak; their lips stay relaxed.")
+        body.append("Hold the final pose silently for the last second.")
+    else:
+        body.append("Nobody speaks: no dialogue, no narration, no singing; lips stay relaxed.")
+    body.append(project.negative_rules)
+
+    lines.append("integrated_multimodal_description: [Shot 1] " + " ".join(b for b in body if b))
+    lines.append("")
+    if project.audio_mode == "native_h3_audio":
+        sound = project.overall_soundscape.strip()
+        if spoken:
+            sound += " The same single narrator voice in every clip. No other voices."
+        else:
+            sound += " No voices."
+    else:
+        sound = "Quiet room tone only. No speech, no voices, no music."
+    lines.append("overall_soundscape: " + sound)
+    lines.append("")
+    lines.append("non_diegetic_music: N/A")
+    return "\n".join(lines)
+
+
+def check_picture_tags(prompt: str, picture_count: int) -> None:
+    used = {int(m.group(1)) for m in re.finditer(r"<Picture\s+(\d+)>", prompt)}
+    bad = sorted(n for n in used if n < 1 or n > picture_count)
+    if bad:
+        raise ValueError(f"prompt mentions {['<Picture %d>' % n for n in bad]} but only {picture_count} "
+                         f"picture(s) are attached")
+
+
+def preview_shot(project: StoryboardProject, shot: ShotSpec, base_dirs: Optional[List[Path]] = None) -> str:
+    plan = shot_picture_plan(project, shot, base_dirs)
+    prompt = build_h3_prompt(project, shot, plan)
+    check_picture_tags(prompt, len(plan))
     return prompt
 
 
-def resolve_shot_references(project: StoryboardProject, shot: ShotSpec, base_dir: Optional[Path] = None) -> List[str]:
-    """Return the ordered list of reference image paths (`<Picture 1>`, `<Picture 2>`, ...) for a shot."""
-    refs: List[str] = []
-    if shot.reference_images:
-        refs.extend(shot.reference_images)
-    else:
-        scene_spec = project.scenes.get(shot.scene_id) or next(iter(project.scenes.values()), None)
-        if scene_spec and scene_spec.image_path:
-            refs.append(scene_spec.image_path)
-        for cid in shot.characters:
-            ch = project.characters.get(cid)
-            if ch and ch.image_path and ch.image_path not in refs:
-                refs.append(ch.image_path)
-
-    if base_dir is not None:
-        resolved: List[str] = []
-        for r in refs:
-            p = Path(r)
-            if not p.is_absolute() and (base_dir / p).exists():
-                resolved.append(str((base_dir / p).resolve()))
-            else:
-                resolved.append(r)
-        return resolved
-    return refs
+# ---------------------------------------------------------------------- parsing
+def _parse_time_cell(raw: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """'0-8s', '00:08-00:18', '8s', '8' -> (start, end, duration); unknown parts are None."""
+    t = (raw or "").strip()
+    if not t:
+        return None, None, None
+    m = re.search(r"(\d{1,2}):(\d{2}(?:\.\d+)?)\s*[-~～至到]\s*(\d{1,2}):(\d{2}(?:\.\d+)?)", t)
+    if m:
+        s = int(m.group(1)) * 60 + float(m.group(2))
+        e = int(m.group(3)) * 60 + float(m.group(4))
+        return s, e, e - s
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:s|秒)?\s*[-~～至到]\s*(\d+(?:\.\d+)?)", t)
+    if m:
+        s, e = float(m.group(1)), float(m.group(2))
+        return s, e, e - s
+    m = re.search(r"(\d+(?:\.\d+)?)", t)
+    if m:
+        return None, None, float(m.group(1))
+    return None, None, None
 
 
-def _parse_duration_cell(raw: str, default: float = 6.0) -> tuple[float, float, float]:
-    """Parse cells like '0-10s', '00:00 - 00:10 (10s)', '8s', '6.5' into (start, end, duration)."""
-    text = (raw or "").strip()
-    if not text:
-        return (0.0, default, default)
-
-    # Check range like 00:10-00:20 or 10-20s
-    m_mmss = re.search(r"(\d{1,2}):(\d{2}(?:\.\d+)?)\s*[-~～至到]\s*(\d{1,2}):(\d{2}(?:\.\d+)?)", text)
-    if m_mmss:
-        s = int(m_mmss.group(1)) * 60 + float(m_mmss.group(2))
-        e = int(m_mmss.group(3)) * 60 + float(m_mmss.group(4))
-        d = max(1.0, e - s)
-        return (s, e, d)
-
-    m_range = re.search(r"(\d+(?:\.\d+)?)\s*(?:s|秒)?\s*[-~～至到]\s*(\d+(?:\.\d+)?)\s*(?:s|秒)?", text)
-    if m_range:
-        s = float(m_range.group(1))
-        e = float(m_range.group(2))
-        d = max(1.0, e - s)
-        return (s, e, d)
-
-    m_single = re.search(r"(\d+(?:\.\d+)?)", text)
-    if m_single:
-        d = max(1.0, float(m_single.group(1)))
-        return (0.0, d, d)
-
-    return (0.0, default, default)
+def _split_list(cell: str) -> List[str]:
+    return [x.strip() for x in re.split(r"[,;，；、\s]+", cell or "") if x.strip()]
 
 
-def load_storyboard_from_markdown(
-    md_text: str,
-    *,
-    title: str = "Markdown_Storyboard",
-    audio_mode: str = "native_h3_audio",
-    continuity_mode: str = "hybrid",
-    default_reference_image: str = "",
-    base_dir: Optional[Path] = None,
-) -> StoryboardProject:
-    """Parse a Markdown storyboard table or section list into a `StoryboardProject`."""
-    proj = StoryboardProject(
-        title=title,
-        audio_mode=audio_mode,
-        continuity_mode=continuity_mode,
-    )
+def _new_project(title: str, audio_mode: Optional[str], continuity_mode: Optional[str],
+                 default_reference_image: str) -> StoryboardProject:
+    p = StoryboardProject(title=title)
+    if audio_mode:
+        p.audio_mode = audio_mode
+    if continuity_mode:
+        p.continuity_mode = continuity_mode
     if default_reference_image:
-        proj.scenes["default"] = SceneAnchorSpec(
-            id="default",
-            description="預設主場景基準圖",
-            image_path=default_reference_image,
-        )
+        p.scenes["default"] = SceneAnchorSpec("default", "", default_reference_image)
+    return p
 
-    lines = [ln.strip() for ln in md_text.splitlines()]
-    table_rows: List[List[str]] = []
+
+def _assign_seeds(p: StoryboardProject) -> None:
+    for s in p.shots:
+        if not s.seed:
+            s.seed = (p.base_seed + s.index * 1009) % (2 ** 63)
+
+
+def load_storyboard_from_markdown(md_text: str, *, title: str = "AI_Movie",
+                                  audio_mode: Optional[str] = None, continuity_mode: Optional[str] = None,
+                                  default_reference_image: str = "", **_: Any) -> StoryboardProject:
+    """Parse the first Markdown table that has a visual/description column."""
+    p = _new_project(title, audio_mode, continuity_mode, default_reference_image)
     headers: List[str] = []
-
-    for ln in lines:
-        if not ln.startswith("|") or not ln.endswith("|"):
+    rows: List[List[str]] = []
+    for ln in md_text.splitlines():
+        ln = ln.strip()
+        if not (ln.startswith("|") and ln.endswith("|")):
+            if headers and rows:
+                break
             continue
         cells = [c.strip() for c in ln.strip("|").split("|")]
-        if all(re.match(r"^[:\-]+$", c.replace(" ", "")) for c in cells if c):
+        if all(re.fullmatch(r":?-{2,}:?", c.replace(" ", "")) for c in cells if c):
             continue
         if not headers:
             headers = [c.lower() for c in cells]
         else:
-            table_rows.append(cells)
+            rows.append(cells)
+    if not headers:
+        raise ValueError("no Markdown table found; expected | 鏡號 | 秒數 | 畫面 | 旁白 | ... |")
 
-    shots: List[ShotSpec] = []
-    cursor_sec = 0.0
+    def col(*keys: str) -> int:
+        for i, h in enumerate(headers):
+            if any(k in h for k in keys):
+                return i
+        return -1
 
-    if table_rows and headers:
-        def _col_idx(keywords: tuple[str, ...], fallback: int = -1) -> int:
-            for idx, h in enumerate(headers):
-                if any(k in h for k in keywords):
-                    return idx
-            return fallback
+    c_id = col("鏡號", "鏡頭", "shot", "編號", "id")
+    c_time = col("秒數", "時間", "時長", "duration", "time", "sec")
+    c_scene = col("場景", "scene")
+    c_char = col("角色", "人物", "character", "cast")
+    c_vis = col("畫面", "視覺", "動作", "描述", "visual", "prompt", "action")
+    c_cam = col("運鏡", "鏡位", "camera")
+    c_dlg = col("旁白", "台詞", "對白", "語音", "dialogue", "narration", "voice")
+    c_spk = col("說話者", "講者", "speaker")
+    c_sub = col("字幕", "subtitle", "caption")
+    c_ref = col("參考圖", "圖片", "ref", "image")
+    c_wav = col("音檔", "wav")
+    if c_vis < 0:
+        raise ValueError(f"Markdown table needs a 畫面/visual column; found headers {headers}")
 
-        id_col = _col_idx(("鏡號", "鏡頭", "shot", "id", "編號", "段落"), 0)
-        dur_col = _col_idx(("秒數", "時間", "時長", "duration", "time", "sec"), 1)
-        scene_col = _col_idx(("場景", "scene"), -1)
-        vis_col = _col_idx(("畫面", "視覺", "動作", "描述", "visual", "prompt", "action"), 2)
-        cam_col = _col_idx(("運鏡", "鏡位", "camera"), -1)
-        dlg_col = _col_idx(("旁白", "台詞", "對白", "語音", "dialogue", "narration", "audio", "voice"), 3)
-        sub_col = _col_idx(("字幕", "caption", "subtitle"), -1)
-        ref_col = _col_idx(("參考圖", "圖片", "ref", "image"), -1)
-
-        for idx, row in enumerate(table_rows, start=1):
-            def _get(c: int) -> str:
-                return row[c].strip() if 0 <= c < len(row) else ""
-
-            raw_id = _get(id_col) or f"shot_{idx:02d}"
-            shot_id = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "_", raw_id).strip("_") or f"shot_{idx:02d}"
-            s_sec, e_sec, dur = _parse_duration_cell(_get(dur_col), default=6.0)
-            if s_sec == 0.0 and idx > 1:
-                s_sec = cursor_sec
-                e_sec = s_sec + dur
-            cursor_sec = e_sec
-
-            visual = _get(vis_col)
-            cam = _get(cam_col) or "固定鏡位或平穩緩慢推鏡，維持軸線與構圖穩定"
-            dialogue = _get(dlg_col)
-            subtitle = _get(sub_col) or _clean_dialogue_tags(dialogue)
-            scene_id = _get(scene_col) or "default"
-            ref_cell = _get(ref_col)
-            refs = [r.strip() for r in re.split(r"[,;，；\s]+", ref_cell) if r.strip()] if ref_cell else []
-            if not refs and default_reference_image:
-                refs = [default_reference_image]
-
-            shot = ShotSpec(
-                shot_id=shot_id,
-                index=idx,
-                title=raw_id,
-                scene_id=scene_id,
-                duration_sec=dur,
-                start_sec=s_sec,
-                end_sec=e_sec,
-                visual_prompt=visual or subtitle or f"鏡頭 {shot_id} 穩定敘事畫面",
-                camera_motion=cam,
-                dialogue=dialogue,
-                subtitle_text=subtitle,
-                reference_images=refs,
-                seed=1000 + idx,
-            )
-            compile_shot_prompt(proj, shot)
-            shots.append(shot)
-    else:
-        # Fallback: parse heading blocks (`### ...` or `## ...`)
-        blocks = re.split(r"(?m)^#{2,3}\s+", md_text)
-        idx = 0
-        for blk in blocks[1:]:
-            blk_lines = [l.strip() for l in blk.splitlines() if l.strip()]
-            if not blk_lines:
-                continue
-            idx += 1
-            heading = blk_lines[0]
-            s_sec, e_sec, dur = _parse_duration_cell(heading, default=6.0)
-            if s_sec == 0.0 and idx > 1:
-                s_sec = cursor_sec
-                e_sec = s_sec + dur
-            cursor_sec = e_sec
-
-            visual_parts: List[str] = []
-            dialogue_parts: List[str] = []
-            subtitle_parts: List[str] = []
-            for ln in blk_lines[1:]:
-                if re.match(r"^[-*]?\s*\**(?:旁白|台詞|對白|語音|Narration|Dialogue)\**[：:]", ln, re.I):
-                    dialogue_parts.append(re.sub(r"^[-*]?\s*\**[^：:]+\**[：:]\s*", "", ln).strip("「」\"' "))
-                elif re.match(r"^[-*]?\s*\**(?:字幕|Subtitle|Caption)\**[：:]", ln, re.I):
-                    subtitle_parts.append(re.sub(r"^[-*]?\s*\**[^：:]+\**[：:]\s*", "", ln).strip("「」\"' "))
-                else:
-                    clean_ln = re.sub(r"^[-*]?\s*\**(?:畫面|視覺|動作|Visual|Prompt)\**[：:]\s*", "", ln, flags=re.I)
-                    visual_parts.append(clean_ln)
-
-            dialogue = " ".join(dialogue_parts).strip()
-            subtitle = " ".join(subtitle_parts).strip() or _clean_dialogue_tags(dialogue)
-            visual = " ".join(visual_parts).strip() or subtitle or heading
-            shot_id = f"shot_{idx:02d}"
-            refs = [default_reference_image] if default_reference_image else []
-            shot = ShotSpec(
-                shot_id=shot_id,
-                index=idx,
-                title=heading,
-                duration_sec=dur,
-                start_sec=s_sec,
-                end_sec=e_sec,
-                visual_prompt=visual,
-                dialogue=dialogue,
-                subtitle_text=subtitle,
-                reference_images=refs,
-                seed=1000 + idx,
-            )
-            compile_shot_prompt(proj, shot)
-            shots.append(shot)
-
-    proj.shots = shots
-    return proj
-
-
-def load_storyboard_from_json(
-    data: Any,
-    *,
-    title: str = "JSON_Storyboard",
-    audio_mode: Optional[str] = None,
-    continuity_mode: Optional[str] = None,
-    default_reference_image: str = "",
-    base_dir: Optional[Path] = None,
-) -> StoryboardProject:
-    """Parse `scenes.json` (list of dicts), `shotlist.json`, or a full `StoryboardProject` JSON dict."""
-    if isinstance(data, list):
-        raw_shots = data
-        meta: Dict[str, Any] = {}
-    elif isinstance(data, dict):
-        meta = data
-        raw_shots = (
-            data.get("shots")
-            or data.get("scenes_list")
-            or data.get("shotlist")
-            or (data.get("scenes") if isinstance(data.get("scenes"), list) else [])
-        )
-    else:
-        raise ValueError("Unsupported JSON storyboard structure")
-
-    proj = StoryboardProject(
-        title=meta.get("title", title),
-        aspect_ratio=meta.get("aspect_ratio", "16:9"),
-        width=int(meta.get("width", 1280)),
-        height=int(meta.get("height", 720)),
-        fps=int(meta.get("fps", 24)),
-        sample_rate=int(meta.get("sample_rate", 48000)),
-        audio_mode=audio_mode or meta.get("audio_mode", "native_h3_audio"),
-        continuity_mode=continuity_mode or meta.get("continuity_mode", "hybrid"),
-        inference_mode=meta.get("inference_mode", "reference"),
-        ref_image_size=meta.get("ref_image_size", "max"),
-        tail_guard_sec=float(meta.get("tail_guard_sec", 0.35)),
-        cfg=float(meta.get("cfg", 4.0)),
-        steps=int(meta.get("steps", 8)),
-        master_audio_path=meta.get("master_audio_path", ""),
-        style_prefix=meta.get("style_prefix", StoryboardProject.style_prefix),
-        negative_rules=meta.get("negative_rules", StoryboardProject.negative_rules),
-    )
-
-    # Load characters if present
-    for cid, cinfo in (meta.get("characters") or {}).items():
-        if isinstance(cinfo, dict):
-            proj.characters[cid] = CharacterSpec(
-                id=cid,
-                name=cinfo.get("name", cid),
-                description=cinfo.get("description", ""),
-                image_path=cinfo.get("image_path", ""),
-                screen_position=cinfo.get("screen_position", ""),
-            )
-        elif isinstance(cinfo, str):
-            proj.characters[cid] = CharacterSpec(id=cid, name=cid, description=cinfo)
-
-    # Load scenes if dict
-    if isinstance(meta.get("scenes"), dict):
-        for sid, sinfo in meta["scenes"].items():
-            if isinstance(sinfo, dict):
-                proj.scenes[sid] = SceneAnchorSpec(
-                    id=sid,
-                    description=sinfo.get("description", ""),
-                    image_path=sinfo.get("image_path", default_reference_image),
-                    axis_rule=sinfo.get("axis_rule", SceneAnchorSpec.axis_rule),
-                )
-            elif isinstance(sinfo, str):
-                proj.scenes[sid] = SceneAnchorSpec(id=sid, description=sinfo, image_path=default_reference_image)
-
-    if default_reference_image and "default" not in proj.scenes:
-        proj.scenes["default"] = SceneAnchorSpec(
-            id="default",
-            description="預設主場景基準圖",
-            image_path=default_reference_image,
-        )
-
-    cursor_sec = 0.0
-    for idx, item in enumerate(raw_shots, start=1):
-        shot_id = str(item.get("shot_id") or item.get("id") or f"shot_{idx:02d}")
-        dur = float(item.get("duration_sec") or item.get("duration") or item.get("seconds") or 6.0)
-        s_sec = float(item.get("start_sec", cursor_sec))
-        e_sec = float(item.get("end_sec", s_sec + dur))
-        cursor_sec = e_sec
-
-        # Handle prompt file or inline visual prompt
-        visual = item.get("visual_prompt") or item.get("prompt") or item.get("visual") or item.get("action") or ""
-        prompt_file = item.get("prompt_file")
-        if not visual and prompt_file and base_dir and (base_dir / prompt_file).exists():
-            visual = (base_dir / prompt_file).read_text(encoding="utf-8").strip()
-
-        dialogue = item.get("dialogue") or item.get("narration") or item.get("spoken_text") or ""
-        if not dialogue and visual:
-            m_dlg = re.search(r"<d>\s*(?:\[[A-Za-z\-]+\]\s*)?(.*?)</d>", visual, flags=re.S | re.I)
-            if m_dlg:
-                dialogue = m_dlg.group(1).strip()
-
-        subtitle = item.get("subtitle_text") or item.get("subtitle") or item.get("caption") or _clean_dialogue_tags(dialogue)
-
-        refs: List[str] = []
-        if item.get("reference_images"):
-            refs = list(item["reference_images"])
-        elif item.get("reference_image"):
-            refs = [str(item["reference_image"])]
-        elif item.get("ref_images"):
-            refs = list(item["ref_images"])
-        elif default_reference_image:
-            refs = [default_reference_image]
-
-        shot = ShotSpec(
-            shot_id=shot_id,
-            index=int(item.get("index", idx)),
-            title=str(item.get("title") or shot_id),
-            scene_id=str(item.get("scene_id") or item.get("scene") or "default"),
-            duration_sec=dur,
-            start_sec=s_sec,
-            end_sec=e_sec,
-            visual_prompt=visual,
-            camera_motion=str(item.get("camera_motion") or item.get("camera") or ShotSpec.camera_motion),
+    for n, row in enumerate(rows, start=1):
+        get = (lambda c: row[c].strip() if 0 <= c < len(row) else "")
+        sid = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "_", get(c_id)).strip("_") or f"shot_{n:02d}"
+        _, _, dur = _parse_time_cell(get(c_time))
+        dialogue = clean_dialogue(get(c_dlg))
+        p.shots.append(ShotSpec(
+            shot_id=sid, index=n, title=get(c_id) or sid,
+            scene_id=get(c_scene) or "default",
+            duration_sec=float(dur) if dur else 8.0,
+            visual_prompt=get(c_vis),
+            camera_motion=get(c_cam),
             dialogue=dialogue,
-            dialogue_lang=str(item.get("dialogue_lang", "Chinese")),
-            subtitle_text=subtitle,
-            characters=list(item.get("characters") or []),
-            reference_images=refs,
-            first_frame_image=str(item.get("first_frame_image") or item.get("first_frame") or ""),
-            narration_wav=str(item.get("narration_wav") or ""),
-            seed=int(item.get("seed", 1000 + idx)),
-            continuity_override=str(item.get("continuity_override", "")),
-            notes=str(item.get("notes", "")),
-        )
-        shot.reference_images = resolve_shot_references(proj, shot, base_dir=base_dir)
-        compile_shot_prompt(proj, shot)
-        proj.shots.append(shot)
-
-    return proj
+            speaker=get(c_spk),
+            subtitle_text=get(c_sub) or dialogue,
+            characters=_split_list(get(c_char)),
+            reference_images=_split_list(get(c_ref)),
+            narration_wav=get(c_wav),
+        ))
+    _assign_seeds(p)
+    return p
 
 
-def load_storyboard_from_mvkit_project(
-    project_path: str | Path,
-    *,
-    audio_mode: str = "master_audio",
-    continuity_mode: str = "hybrid",
-) -> StoryboardProject:
-    """Adapt an `autoip-mv-maker` `project.py` directory/file into a `StoryboardProject`."""
-    from .common import load_project, audio_path
-    from .storyboard import project_spec
+def load_storyboard_from_json(data: Any, *, title: str = "AI_Movie", audio_mode: Optional[str] = None,
+                              continuity_mode: Optional[str] = None, default_reference_image: str = "",
+                              base_dir: Optional[Path] = None, **_: Any) -> StoryboardProject:
+    """Accept a full project dict, or a bare list of shots (scenes.json / shotlist.json)."""
+    meta: Dict[str, Any] = data if isinstance(data, dict) else {}
+    raw_shots = data if isinstance(data, list) else (
+        meta.get("shots") or meta.get("shotlist") or (meta.get("scenes") if isinstance(meta.get("scenes"), list) else []))
+    p = _new_project(meta.get("title", title), audio_mode or meta.get("audio_mode"),
+                     continuity_mode or meta.get("continuity_mode"), default_reference_image)
+    if meta.get("aspect_ratio"):
+        p.set_aspect(meta["aspect_ratio"])
+    for key in ("inference_mode", "ref_image_size", "master_audio_path", "style_prefix", "continuity_rules",
+                "negative_rules", "narrator", "overall_soundscape"):
+        if meta.get(key):
+            setattr(p, key, meta[key])
+    for key, cast in (("tail_guard_sec", float), ("base_seed", int), ("sample_rate", int)):
+        if key in meta:
+            setattr(p, key, cast(meta[key]))
 
-    proj_mod = load_project(str(project_path))
-    spec = project_spec(proj_mod)
+    for cid, c in (meta.get("characters") or {}).items():
+        c = c if isinstance(c, dict) else {"description": str(c)}
+        p.characters[cid] = CharacterSpec(cid, c.get("name", cid), c.get("description", ""),
+                                          c.get("image_path", ""), c.get("screen_position", ""))
+    if isinstance(meta.get("scenes"), dict):
+        for sid, s in meta["scenes"].items():
+            s = s if isinstance(s, dict) else {"description": str(s)}
+            p.scenes[sid] = SceneAnchorSpec(sid, s.get("description", ""),
+                                            s.get("image_path", "") or default_reference_image)
 
-    master_wav = ""
-    try:
-        cand = audio_path(proj_mod, "wav")
-        if os.path.exists(cand):
-            master_wav = cand
-    except Exception:
-        pass
-
-    sb = StoryboardProject(
-        title=getattr(proj_mod, "TITLE", Path(str(project_path)).stem),
-        aspect_ratio=getattr(proj_mod, "ASPECT_RATIO", "16:9"),
-        audio_mode=audio_mode,
-        continuity_mode=continuity_mode,
-        master_audio_path=master_wav,
-        style_prefix=getattr(proj_mod, "STYLE", StoryboardProject.style_prefix),
-        tail_guard_sec=float(getattr(proj_mod, "TAIL_GUARD", 0.35)),
-    )
-
-    for cid, cdesc in (spec.get("characters") or {}).items():
-        ref_file = (getattr(proj_mod, "REFS", {}) or {}).get(cid, f"{cid}.png")
-        ref_full = os.path.join(proj_mod.PROJECT_DIR, "refs", ref_file)
-        sb.characters[cid] = CharacterSpec(
-            id=cid,
-            name=cid,
-            description=cdesc,
-            image_path=ref_full if os.path.exists(ref_full) else ref_file,
-        )
-
-    for sid, sdesc in (spec.get("scenes") or {}).items():
-        ref_file = (getattr(proj_mod, "REFS", {}) or {}).get(sid, f"{sid}.png")
-        ref_full = os.path.join(proj_mod.PROJECT_DIR, "refs", ref_file)
-        sb.scenes[sid] = SceneAnchorSpec(
-            id=sid,
-            description=sdesc,
-            image_path=ref_full if os.path.exists(ref_full) else ref_file,
-        )
-
-    idx = 0
-    for sec in spec.get("sections", []):
-        sec_name = sec.get("name", "section")
-        scene_id = sec.get("scene", "default")
-        chars = list(sec.get("characters") or [])
-        lines = sec.get("lines") or []
-        sec_start = float(sec.get("start", 0.0))
-        sec_end = float(sec.get("end", sec_start + 6.0))
-        sec_dur = max(2.0, sec_end - sec_start)
-
-        if lines:
-            for l_idx, ln in enumerate(lines):
-                idx += 1
-                l_start = float(ln.get("t", sec_start))
-                l_end = float(lines[l_idx + 1]["t"]) if l_idx + 1 < len(lines) else sec_end
-                l_dur = max(2.0, round(l_end - l_start, 2))
-                shot = ShotSpec(
-                    shot_id=f"{sec_name}_{l_idx:02d}",
-                    index=idx,
-                    title=f"{sec_name} #{l_idx + 1}",
-                    scene_id=scene_id,
-                    duration_sec=l_dur,
-                    start_sec=l_start,
-                    end_sec=l_end,
-                    visual_prompt=f"{sec.get('Scene_Description', '')}；角色動作：{ln.get('action', '')}",
-                    dialogue=ln.get("lyric", ""),
-                    subtitle_text=ln.get("lyric", ""),
-                    characters=chars,
-                    seed=1000 + idx,
-                )
-                shot.reference_images = resolve_shot_references(sb, shot)
-                compile_shot_prompt(sb, shot)
-                sb.shots.append(shot)
-        else:
-            idx += 1
-            shot = ShotSpec(
-                shot_id=f"{sec_name}_00",
-                index=idx,
-                title=sec_name,
-                scene_id=scene_id,
-                duration_sec=sec_dur,
-                start_sec=sec_start,
-                end_sec=sec_end,
-                visual_prompt=f"{sec.get('Scene_Description', '')}；{sec.get('action', '')}",
-                characters=chars,
-                seed=1000 + idx,
-            )
-            shot.reference_images = resolve_shot_references(sb, shot)
-            compile_shot_prompt(sb, shot)
-            sb.shots.append(shot)
-
-    return sb
+    for n, it in enumerate(raw_shots, start=1):
+        visual = it.get("visual_prompt") or it.get("prompt") or it.get("visual") or it.get("description") or ""
+        if not visual and it.get("prompt_file") and base_dir and (Path(base_dir) / it["prompt_file"]).is_file():
+            visual = (Path(base_dir) / it["prompt_file"]).read_text(encoding="utf-8").strip()
+        dialogue = it.get("dialogue") or it.get("narration") or ""
+        if not dialogue:
+            m = re.search(r"<d>\s*(?:\[[A-Za-z\-]+\]\s*)?(.*?)</d>", visual, flags=re.S | re.I)
+            if m:
+                dialogue = m.group(1)
+        dialogue = clean_dialogue(dialogue)
+        refs = it.get("reference_images") or ([it["reference_image"]] if it.get("reference_image") else [])
+        p.shots.append(ShotSpec(
+            shot_id=str(it.get("shot_id") or it.get("id") or f"shot_{n:02d}"),
+            index=int(it.get("index", n)),
+            title=str(it.get("title", "")),
+            scene_id=str(it.get("scene_id") or it.get("scene") or "default"),
+            duration_sec=float(it.get("duration_sec") or it.get("duration") or it.get("seconds") or 8.0),
+            visual_prompt=visual,
+            camera_motion=str(it.get("camera_motion") or it.get("camera") or ""),
+            dialogue=dialogue,
+            speaker=str(it.get("speaker", "")),
+            subtitle_text=str(it.get("subtitle_text") or it.get("subtitle") or dialogue),
+            characters=list(it.get("characters") or []),
+            reference_images=list(refs),
+            narration_wav=str(it.get("narration_wav", "")),
+            seed=int(it.get("seed", 0)),
+            continuity_override=str(it.get("continuity_override", "")),
+            notes=str(it.get("notes", "")),
+        ))
+    _assign_seeds(p)
+    return p
 
 
-def load_storyboard(
-    source: str | Path,
-    *,
-    audio_mode: Optional[str] = None,
-    continuity_mode: Optional[str] = None,
-    default_reference_image: str = "",
-) -> StoryboardProject:
-    """Auto-detect and load a storyboard from `.md`, `.json`, or `project.py` (or directory)."""
-    p = Path(source)
-    if p.is_dir() or p.name.endswith(".py"):
-        return load_storyboard_from_mvkit_project(
-            p,
-            audio_mode=audio_mode or "master_audio",
-            continuity_mode=continuity_mode or "hybrid",
-        )
-    if not p.exists():
-        raise FileNotFoundError(f"Storyboard source not found: {p}")
+def load_storyboard_from_mvkit_project(project_path: str | Path, *, audio_mode: Optional[str] = None,
+                                       continuity_mode: Optional[str] = None, **_: Any) -> StoryboardProject:
+    """Adapt an autoip-mv-maker project.py: every shot id listed in SECTIONS becomes one H3 clip.
 
-    if p.suffix.lower() == ".json":
-        raw = json.loads(p.read_text(encoding="utf-8"))
-        return load_storyboard_from_json(
-            raw,
-            title=p.stem,
-            audio_mode=audio_mode,
-            continuity_mode=continuity_mode,
-            default_reference_image=default_reference_image,
-            base_dir=p.parent,
-        )
+    The song is the single master track; lyric lines become absolute-timed subtitles.
+    """
+    path = Path(project_path)
+    pdir = path if path.is_dir() else path.parent
+    spec = importlib.util.spec_from_file_location("mv_project", pdir / "project.py")
+    if spec is None or spec.loader is None:
+        raise FileNotFoundError(f"no project.py in {pdir}")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
 
-    md_text = p.read_text(encoding="utf-8")
-    return load_storyboard_from_markdown(
-        md_text,
-        title=p.stem,
-        audio_mode=audio_mode or "native_h3_audio",
-        continuity_mode=continuity_mode or "hybrid",
-        default_reference_image=default_reference_image,
-        base_dir=p.parent,
-    )
+    p = StoryboardProject(title=getattr(m, "NAME", pdir.name))
+    p.audio_mode = audio_mode or "master_audio"
+    p.continuity_mode = continuity_mode or "anchor"
+    song = getattr(m, "SONG", "")
+    p.master_audio_path = str(pdir / song) if song else ""
+    if getattr(m, "STYLE", ""):
+        p.style_prefix = m.STYLE
+    prefix = getattr(m, "MOTION_PREFIX", "")
+
+    for cid, c in getattr(m, "CHARS", {}).items():
+        p.characters[cid] = CharacterSpec(cid, c.get("name", cid), c.get("desc", ""),
+                                          str(pdir / c["file"]) if c.get("file") else "")
+
+    catalog: Dict[str, Tuple[str, List[str]]] = {}
+    ls_scene = {s[0]: s for s in getattr(m, "LS_SCENES", [])}
+    for sid, _cap, prompt, motion in getattr(m, "BROLL", []):
+        catalog[sid] = (f"{prompt}. {motion}", [])
+    for sid, chars, _cap, prompt, motion in getattr(m, "BAND", []):
+        chars = chars if isinstance(chars, list) else [chars]
+        catalog[sid] = (f"{prompt}. {motion}".strip(". "), chars)
+    for sid, scene_id, _a0, _dur, _voice in getattr(m, "LIPSYNC", []):
+        sc = ls_scene.get(scene_id)
+        if sc:
+            catalog[sid] = (f"{sc[2]}. {sc[3]}", [sc[1]])
+
+    n = 0
+    longest = H3_MAX_SECONDS - p.tail_guard_sec
+    for name, (a, b), _typo, lines, shot_ids in getattr(m, "SECTIONS", []):
+        ids = [s for s in shot_ids if s in catalog] or []
+        if not ids:
+            continue
+        per = (b - a) / len(ids)
+        pieces = max(1, math.ceil(per / longest))
+        for sid in ids:
+            visual, chars = catalog[sid]
+            for k in range(pieces):
+                n += 1
+                p.shots.append(ShotSpec(
+                    shot_id=f"{sid}_{k + 1}" if pieces > 1 else sid, index=n, title=name,
+                    scene_id=sid, duration_sec=round(per / pieces, 3),
+                    visual_prompt=f"{prefix}{visual}", characters=list(chars)))
+        for i, (t, text, _voice) in enumerate(lines):
+            end = lines[i + 1][0] if i + 1 < len(lines) else b
+            p.subtitle_cues.append((float(t), float(end) - 0.1, text))
+    _assign_seeds(p)
+    return p
+
+
+def load_storyboard(source: str | Path, *, audio_mode: Optional[str] = None,
+                    continuity_mode: Optional[str] = None, default_reference_image: str = "") -> StoryboardProject:
+    """Auto-detect `.md`, `.json`, `project.py` or a project folder."""
+    src = Path(source)
+    if src.is_dir() or src.name == "project.py":
+        return load_storyboard_from_mvkit_project(src, audio_mode=audio_mode, continuity_mode=continuity_mode)
+    if not src.is_file():
+        raise FileNotFoundError(f"storyboard not found: {src}")
+    if src.suffix.lower() == ".json":
+        return load_storyboard_from_json(json.loads(src.read_text(encoding="utf-8")), title=src.stem,
+                                         audio_mode=audio_mode, continuity_mode=continuity_mode,
+                                         default_reference_image=default_reference_image, base_dir=src.parent)
+    return load_storyboard_from_markdown(src.read_text(encoding="utf-8"), title=src.stem, audio_mode=audio_mode,
+                                         continuity_mode=continuity_mode,
+                                         default_reference_image=default_reference_image)

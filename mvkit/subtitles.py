@@ -2,24 +2,24 @@
 
 Supports:
 1. Storyboard-driven subtitle generation (`.zh-TW.srt` and `.ass` with clean movie/teaching styling):
-   - Automatically splits long sentences by punctuation into readable clauses
-   - Proportionally allocates durations within each shot's window
-2. Optional `faster-whisper` ASR timing alignment (`align_subtitles_with_asr`):
+   - Splits long sentences by punctuation into readable clauses (<= 18 chars per line)
+   - Proportionally allocates durations within each shot's actual normalized duration
+   - Also supports song-level absolute lyric cues (`project.subtitle_cues`) from `autoip-mv-maker` `project.py`
+2. Optional `faster-whisper` ASR timing alignment (`align_cues_with_asr`):
    - Transcribes the final single audio stream for word timestamps while keeping the user's
      exact Traditional Chinese script text (preventing ASR homophone typos).
-   - Automatically falls back to storyboard timings if `faster-whisper` is not installed or a line is silent.
+   - Defaults to CPU (`device="cpu"`) so it never collides with ComfyUI VRAM or missing cuDNN DLLs.
 3. FFmpeg ASS burn-in (`burn_subtitles_into_video`) that strictly preserves the single audio stream.
 """
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from .script_loader import ShotSpec, StoryboardProject, _clean_dialogue_tags
+from .script_loader import StoryboardProject, clean_dialogue
 
 
 @dataclass
@@ -33,7 +33,7 @@ class SubtitleCue:
 
 def split_chinese_clauses(text: str, max_chars: int = 18) -> List[str]:
     """Split a paragraph of Traditional Chinese dialogue into readable subtitle clauses."""
-    clean = _clean_dialogue_tags(text)
+    clean = clean_dialogue(text)
     clean = re.sub(r"\s+", " ", clean).strip()
     if not clean:
         return []
@@ -58,10 +58,9 @@ def split_chinese_clauses(text: str, max_chars: int = 18) -> List[str]:
     if buf:
         clauses.append(buf)
 
-    # Hard wrap any clause that is still too long
     final_clauses: List[str] = []
     for c in clauses:
-        while len(c) > max_chars * 1.4:
+        while len(c) > int(max_chars * 1.4):
             final_clauses.append(c[:max_chars])
             c = c[max_chars:]
         if c:
@@ -77,11 +76,39 @@ def build_cues_from_storyboard(
     lead_in_sec: float = 0.12,
     tail_pad_sec: float = 0.12,
 ) -> List[SubtitleCue]:
-    """Generate `SubtitleCue` items from the storyboard's shots and actual clip durations."""
+    """Generate `SubtitleCue` items from the storyboard's shots (or absolute `project.subtitle_cues` for MVs)."""
     cues: List[SubtitleCue] = []
-    cursor = 0.0
     cue_idx = 1
 
+    # If the project has absolute-timed MV lyric cues and shots have no per-shot dialogue, use subtitle_cues
+    if project.subtitle_cues and not any((s.subtitle_text or s.dialogue) for s in project.shots):
+        total_limit = sum(clip_durations) if clip_durations else None
+        for start_s, end_s, raw_text in project.subtitle_cues:
+            if total_limit is not None and start_s >= total_limit:
+                continue
+            clauses = split_chinese_clauses(raw_text, max_chars=max_chars_per_line)
+            if not clauses:
+                continue
+            e_clamped = min(end_s, total_limit) if total_limit is not None else end_s
+            span = max(0.4, e_clamped - start_s)
+            total_w = sum(max(2, len(c)) for c in clauses)
+            t_cur = start_s
+            for i_c, clause in enumerate(clauses):
+                w = max(2, len(clause))
+                t_next = e_clamped if i_c == len(clauses) - 1 else round(t_cur + span * (w / total_w), 3)
+                cues.append(
+                    SubtitleCue(
+                        index=cue_idx,
+                        start_sec=round(t_cur, 3),
+                        end_sec=round(max(t_cur + 0.25, t_next), 3),
+                        text=clause,
+                    )
+                )
+                cue_idx += 1
+                t_cur = t_next
+        return cues
+
+    cursor = 0.0
     for idx, shot in enumerate(project.shots):
         dur = (
             float(clip_durations[idx])
@@ -127,9 +154,9 @@ def align_cues_with_asr(
     audio_or_video_path: str | Path,
     *,
     model_size: str = "small",
-    device: str = "auto",
+    device: str = "cpu",
 ) -> List[SubtitleCue]:
-    """Optionally refine cue start/end times using `faster-whisper` word timestamps while preserving exact script text."""
+    """Refine cue start/end times using `faster-whisper` word timestamps while preserving exact script text."""
     if not cues:
         return cues
     try:
@@ -164,7 +191,6 @@ def align_cues_with_asr(
     if not words:
         return cues
 
-    # Refine each cue within its shot window if ASR words fall inside [cue.start - 0.6, cue.end + 0.6]
     refined: List[SubtitleCue] = []
     for cue in cues:
         local_words = [
@@ -186,7 +212,6 @@ def align_cues_with_asr(
         else:
             refined.append(cue)
 
-    # Prevent overlaps between consecutive cues
     for i in range(len(refined) - 1):
         if refined[i].end_sec > refined[i + 1].start_sec:
             mid = round((refined[i].end_sec + refined[i + 1].start_sec) / 2.0, 3)
@@ -235,11 +260,11 @@ def write_ass(
     cues: Sequence[SubtitleCue],
     output_ass: str | Path,
     *,
-    width: int = 1280,
-    height: int = 720,
+    width: int = 1344,
+    height: int = 768,
     font_name: str = "Noto Sans CJK TC",
-    font_size: int = 38,
-    margin_v: int = 36,
+    font_size: int = 40,
+    margin_v: int = 38,
 ) -> Path:
     """Write cues to an `.ass` subtitle file with a clean semi-transparent bottom box & outline."""
     out = Path(output_ass)
@@ -294,12 +319,14 @@ def burn_subtitles_into_video(
         "-map", "0:v:0",
         "-map", "0:a:0",
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "18",
+        "-preset", "fast",
+        "-crf", "17",
         "-pix_fmt", "yuv420p",
         "-c:a", "copy",
         "-movflags", "+faststart",
         str(out_p),
     ]
-    subprocess.run(cmd, check=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode:
+        raise RuntimeError("ffmpeg subtitle burn failed:\n" + " ".join(cmd) + "\n" + r.stderr[-3000:])
     return out_p
