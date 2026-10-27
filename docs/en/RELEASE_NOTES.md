@@ -2,6 +2,17 @@
 
 [中文](../zh-TW/RELEASE_NOTES.md) | English
 
+## 0.7.0 (2026-10-28): teaching / recruitment / OSCE demo videos: script upload, character and scene bible, 2-minute review batches
+
+- **`script_import.py`** (new): reads free-form scripts ("分鏡 1：…" with 場景／畫面／對話/口白／動作與評分重點) from `.txt`, `.md`, `.docx` and AI Studio exports, estimates durations from the spoken line and splits lines too long for one clip into chained `03a`, `03b`. Tables, JSON and `project.py` load as before.
+- **`alignment.py`** (new): character bible (aliases, appearance, picture, position, voice, lead) and scene bible (aliases, description, picture, cast). Every shot is aligned to it; characters always go to `<Picture 2..>` in bible order; `（口述）` / `（對病人）` resolve the speaker; framing-only lines ("特寫…") stay in the current room. The report lists missing pictures and unmatched names.
+- **`batches.py`** (new): review batches of at most 2 minutes, cut at scene changes when possible; batch k+1 only after batch k is approved; `redo_shots` regenerates only the named shots with a new seed; edited shots regenerate automatically; preview, checklist, GPU-time estimate; missing pictures are caught before any model download.
+- **`presets.py`** (new): `osce_demo`, `teaching`, `recruitment`.
+- **`script_loader.py`**: characters gain `aliases`, `voice`, `lead`; scenes gain `name`, `aliases`, `cast`; a speaker with a picture is named by that picture in the prompt with a fixed voice; `save_project_json`.
+- **`h3_colab_runner.py`**: `run_storyboard(shot_ids=...)` generates one batch; `progress.json` stores a per-shot fingerprint and regenerates changed shots.
+- Notebook: 6 steps; workspace on Google Drive by default; planning mode without a GPU; optional runtime disconnect after each batch.
+- Docs: `docs/zh-TW/EDU_VIDEO_WORKFLOW.md`, `examples/osce_demo/`.
+
 ## 0.6.1 (2026-10-27): optional NVIDIA GPU speed-ups, CPU still the default
 
 - **`gpu_check.py`** (new): shows which steps this machine's NVIDIA GPU can take over and prints the env flags or installs for each. Without a GPU it says everything runs on the CPU.

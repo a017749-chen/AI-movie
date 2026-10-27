@@ -2,7 +2,7 @@
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/a017749-chen/AI-movie/blob/main/AI_Movie_Maker_Colab.ipynb)
 
-本專案將 **[autoip/autoip-mv-maker](https://github.com/autoip/autoip-mv-maker)** 的分鏡腳本架構與 **`MiniMax_H3_Turbo_Colab.ipynb` (`1zdxzAm834HesHG2uu7GbM4Kv0kbKOLLu`)** 的真實 ComfyUI 節點工作流完整整合，專為 Google Colab GPU（建議 A100）部署設計，解決四大核心痛點：
+本專案將 **[autoip/autoip-mv-maker](https://github.com/autoip/autoip-mv-maker)** 的分鏡腳本架構與 **`MiniMax_H3_Turbo_Colab.ipynb` (`1zdxzAm834HesHG2uu7GbM4Kv0kbKOLLu`)** 的真實 ComfyUI 節點工作流完整整合，專為 Google Colab GPU（建議 A100）部署設計，解決五大核心需求：
 
 1. **🛡️ 畫面連貫不跑掉（Visual Continuity & Anti-Drift）**
    - **對齊官方 ComfyUI 節點與模型庫**：使用官方 [`Comfy-Org/ComfyUI`](https://github.com/Comfy-Org/ComfyUI) 的 `MiniMaxH3ReferenceToVideo`（Ref2VA，支援 1–9 張參照圖 `ref_images.ref_image_0..8`）與 `MiniMaxH3ImageToVideo`（FL2VA 首幀模式），搭配 `Comfy-Org/MiniMax-H3` 及 `drbaph/MiniMax-H3-Turbo-Lora-ComfyUI` 權重，自動依 CUDA 版本與 GPU 架構選擇 `int8_convrot`、`fp8_scaled` 或 `bf16`。
@@ -31,14 +31,23 @@
      - `<title>.zh-TW.srt` 與 `<title>.zh-TW.ass` 外掛字幕檔
      - `<title>_review_sheet.jpg` 全片各鏡中點抽幀連貫性檢視圖表
 
+5. **🎓 教學／招生／OSCE 示範影片流程（腳本上傳 × 角色對齊 × 場景設定 × 每 2 分鐘確認）**
+   - **腳本上傳**：直接上傳平常寫的腳本（`分鏡 1：` + `場景：` `畫面：` `對話/口白：` `動作與評分重點：`），支援 `.txt` `.md` `.docx` 與 AI Studio 匯出檔；沒寫秒數會依台詞長度估算，太長的台詞自動拆鏡。
+   - **角色對齊**：角色表固定每個人的參考圖、外觀、站位、聲音與別名；`（口述）`、`（對病人）` 自動判斷說話者，角色依固定順序送入 `<Picture 2..>`。
+   - **場景設定**：場景表用別名對應腳本的場景文字；「特寫…」不會被當成新場景。
+   - **分段審核**：每次只生成下一段（預設 ≤ 2 分鐘），產出預覽、抽幀檢視圖與審核表；`approve` 後才會生成下一段，`redo_shots` 只重拍指定鏡號並自動換 seed。生成前先檢查缺圖，工作資料夾放 Google Drive 可斷線接續。
+   - **用途預設**：`osce_demo`、`teaching`、`recruitment`。
+   - 詳見 [`docs/zh-TW/EDU_VIDEO_WORKFLOW.md`](docs/zh-TW/EDU_VIDEO_WORKFLOW.md)，範例在 [`examples/osce_demo/`](examples/osce_demo/)。
+
 ---
 
 ## 🚀 在 Google Colab 一鍵啟動
 
 點擊 **[Open in Colab](https://colab.research.google.com/github/a017749-chen/AI-movie/blob/main/AI_Movie_Maker_Colab.ipynb)** 開啟 [`AI_Movie_Maker_Colab.ipynb`](AI_Movie_Maker_Colab.ipynb)：
 
-1. **Step 1**：檢查 GPU 與磁碟空間（至少 60 GiB）、在 `/content/ComfyUI` 安裝 `Comfy-Org/ComfyUI` 與 `ComfyUI-VideoHelperSuite`（所有環境與模型直接建在 Colab 本機高速磁碟，不掛載、不佔用 Google Drive）。
-2. **Step 2**：上傳場景基準圖（`<Picture 1>`）與角色設定圖（`<Picture 2..N>`）。
-3. **Step 3**：貼上 **Markdown 分鏡表格**（或上傳 `.md` / `.json` / `project.py`），選擇 `AUDIO_MODE` 與 `CONTINUITY_MODE`，並預覽完整 H3 Prompt。
-4. **Step 4**：直接在 `/content/ComfyUI/models` 下載所需 MiniMax H3 權重、啟動 ComfyUI 並批次生成分鏡（支援 `progress.json` 斷點續傳，以及設定 `ONLY_SHOT_IDS` 單獨重抽特定鏡號）。
-5. **Step 5**：釋放顯存、合成單一聲軌、對齊並燒錄繁體中文字幕、通過 `ffprobe` 單一音軌驗證並直接下載成品。
+1. **Step 1**：安裝環境；工作資料夾（腳本、參考圖、片段、審核紀錄）預設放 Google Drive，模型與 ComfyUI 仍裝在 Colab 本機 `/content`。沒有 GPU 時進入規劃模式。
+2. **Step 2**：上傳場景圖（`<Picture 1>`）與角色圖（`<Picture 2..N>`）。
+3. **Step 3**：上傳腳本與角色／場景設定表，選用途預設 → 對齊報告、2 分鐘分段計畫、Prompt 預覽（可用 CPU 執行階段）。
+4. **Step 4**：只生成下一段（≤ 2 分鐘），輸出預覽影片、抽幀檢視圖與審核表，並估算剩餘 GPU 時間。
+5. **Step 5**：審核 `approve` 或 `redo_shots`（只重拍指定鏡號）。
+6. **Step 6**：全部確認後合成單一聲軌、繁體中文字幕全片並下載（不需要 GPU）。
