@@ -37,8 +37,8 @@
 
 點擊 **[Open in Colab](https://colab.research.google.com/github/a017749-chen/AI-movie/blob/main/AI_Movie_Maker_Colab.ipynb)** 開啟 [`AI_Movie_Maker_Colab.ipynb`](AI_Movie_Maker_Colab.ipynb)：
 
-1. **Step 1**：檢查 GPU、掛載 Google Drive（透過 ComfyUI `extra_model_paths.yaml` 直接讀取 `/content/drive/MyDrive/ComfyUI_MiniMax_H3/models` 既有權重，免複製大檔）、安裝 `Comfy-Org/ComfyUI` 與 `ComfyUI-VideoHelperSuite`。
+1. **Step 1**：檢查 GPU 與磁碟空間（至少 60 GiB）、在 `/content/ComfyUI` 安裝 `Comfy-Org/ComfyUI` 與 `ComfyUI-VideoHelperSuite`（所有環境與模型直接建在 Colab 本機高速磁碟，不掛載、不佔用 Google Drive）。
 2. **Step 2**：上傳場景基準圖（`<Picture 1>`）與角色設定圖（`<Picture 2..N>`）。
 3. **Step 3**：貼上 **Markdown 分鏡表格**（或上傳 `.md` / `.json` / `project.py`），選擇 `AUDIO_MODE` 與 `CONTINUITY_MODE`，並預覽完整 H3 Prompt。
-4. **Step 4**：自動配置模型、啟動 ComfyUI 並批次生成分鏡（支援 `progress.json` 斷點續傳，以及設定 `ONLY_SHOT_IDS` 單獨重抽特定鏡號）。
-5. **Step 5**：釋放顯存、合成單一聲軌、對齊並燒錄繁體中文字幕、通過 `ffprobe` 單一音軌驗證並下載成品。
+4. **Step 4**：直接在 `/content/ComfyUI/models` 下載所需 MiniMax H3 權重、啟動 ComfyUI 並批次生成分鏡（支援 `progress.json` 斷點續傳，以及設定 `ONLY_SHOT_IDS` 單獨重抽特定鏡號）。
+5. **Step 5**：釋放顯存、合成單一聲軌、對齊並燒錄繁體中文字幕、通過 `ffprobe` 單一音軌驗證並直接下載成品。

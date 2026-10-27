@@ -1,8 +1,7 @@
 """Run a storyboard on Colab: ComfyUI + MiniMax H3 (Ref2VA or FL2VA), one clip per storyboard row.
 
-The ComfyUI graph, model files, variant selection and frame rule are taken from the upstream
-`MiniMax_H3_Turbo_Colab.ipynb` (the notebook behind the user's Colab copy) and the official
-Comfy-Org reference-to-video workflow:
+All models are downloaded directly into Colab's local disk (`/content/ComfyUI/models`), matching
+`MiniMax_H3_Turbo_Colab.ipynb` (no Google Drive model storage or slow Drive I/O):
 
   UNETLoader -> LoraLoaderModelOnly -> BasicGuider
   CLIPLoader(type="minimax") + VAELoader(video) + VAELoader(audio)
@@ -157,14 +156,13 @@ def extract_clean_continuity_frame(video_path: str | Path, output_png: str | Pat
 
 
 class H3ColabRunner:
-    """Drives a ComfyUI server on the Colab VM. `generate_fn` can be swapped out in tests."""
+    """Drives a ComfyUI server on the Colab VM with models stored directly in `/content/ComfyUI/models`."""
 
     def __init__(self, comfy_dir: str | Path = "/content/ComfyUI", base_url: str = "http://127.0.0.1:8188",
-                 model_roots: Optional[List[str | Path]] = None, models: Optional[ModelSet] = None,
+                 models: Optional[ModelSet] = None,
                  log_path: str | Path = "/content/comfyui_ai_movie.log") -> None:
         self.comfy_dir = Path(comfy_dir)
         self.base_url = base_url.rstrip("/")
-        self.model_roots = [Path(r) for r in (model_roots or [])]
         self.models = models
         self.log_path = Path(log_path)
         self.process: Optional[subprocess.Popen] = None
@@ -177,40 +175,24 @@ class H3ColabRunner:
         self.models = choose_models(mode, torch.version.cuda or "0", torch.cuda.get_device_capability(0))
         return self.models
 
-    def _find(self, folder: str, name: str) -> Optional[Path]:
-        for root in self.model_roots + [self.comfy_dir / "models"]:
-            p = root / folder / name
-            if p.is_file() and p.stat().st_size > 0:
-                return p
-        return None
-
-    def ensure_models(self, download_to: Optional[str | Path] = None) -> Dict[str, str]:
-        """Reuse files found in any model root (e.g. Google Drive); download only what is missing.
-
-        Extra roots are registered via ComfyUI's extra_model_paths.yaml so nothing is copied.
-        """
+    def ensure_models(self) -> Dict[str, str]:
+        """Download required H3 model weights directly into `/content/ComfyUI/models`."""
         from huggingface_hub import hf_hub_download
 
         assert self.models, "call detect_models() first"
-        target_root = Path(download_to) if download_to else self.comfy_dir / "models"
+        models_root = self.comfy_dir / "models"
         found: Dict[str, str] = {}
         for repo, remote, folder in self.models.files():
             name = Path(remote).name
-            path = self._find(folder, name)
-            if path is None:
-                print(f"downloading {repo}/{remote} -> {target_root / folder}")
-                local_dir = target_root if repo == BASE_REPO else target_root / folder
-                path = Path(hf_hub_download(repo_id=repo, filename=remote, local_dir=str(local_dir)))
-            found[name] = str(path)
-            print(f"  {folder:16s} {name}  {path.stat().st_size / 2**30:.2f} GiB  ({path.parent})")
-        roots = {str(Path(p).parent.parent) for p in found.values()}
-        roots.discard(str(self.comfy_dir / "models"))
-        if roots:
-            lines = []
-            for i, r in enumerate(sorted(roots)):
-                lines.append(f"ai_movie_{i}:\n  base_path: {r}\n" +
-                             "".join(f"  {k}: {k}\n" for k in ("diffusion_models", "text_encoders", "vae", "loras")))
-            (self.comfy_dir / "extra_model_paths.yaml").write_text("".join(lines), encoding="utf-8")
+            target = models_root / folder / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.is_file() or target.stat().st_size == 0:
+                print(f"downloading {repo}/{remote} -> {target}")
+                local_dir = models_root if repo == BASE_REPO else models_root / folder
+                downloaded = Path(hf_hub_download(repo_id=repo, filename=remote, local_dir=str(local_dir)))
+                assert downloaded == target, f"unexpected download path: {downloaded} != {target}"
+            found[name] = str(target)
+            print(f"  {folder:16s} {name}  {target.stat().st_size / 2**30:.2f} GiB")
         return found
 
     # ------------------------------------------------------------------ server
