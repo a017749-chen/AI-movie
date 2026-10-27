@@ -24,8 +24,9 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Collection, Dict, List, Optional
 
+from .batches import shot_fingerprint
 from .script_loader import (
     PictureRef,
     ShotSpec,
@@ -311,10 +312,14 @@ class H3ColabRunner:
 
     def run_storyboard(self, project: StoryboardProject, work_dir: str | Path, *,
                        base_dirs: Optional[List[str | Path]] = None, resume: bool = True,
-                       only: Optional[List[str]] = None) -> List[Path]:
+                       only: Optional[List[str]] = None,
+                       shot_ids: Optional[Collection[str]] = None) -> List[Path]:
         """Generate every shot in order. Finished clips are recorded in progress.json and skipped on resume.
 
         `only` regenerates the listed shot ids (their old clips are replaced).
+        `shot_ids` limits the run to one review batch: other shots are never generated, but their existing
+        clips still feed last-frame chaining, and only the batch's clips are returned.
+        A clip whose shot was edited (text, seed, pictures, bible entry) since it was made is regenerated.
         """
         project.validate()
         assert self.models, "call detect_models() first"
@@ -334,10 +339,19 @@ class H3ColabRunner:
         prev_scene: Optional[str] = None
         for shot in project.shots:
             clip = clips_dir / f"{shot.index:02d}_{shot.shot_id}.mp4"
+            if shot_ids is not None and shot.shot_id not in shot_ids:
+                have = clip.is_file() and clip.stat().st_size > 0
+                prev_clip, prev_scene = (clip if have else None), shot.scene_id
+                continue
+            fingerprint = shot_fingerprint(project, shot)
             redo = only is not None and shot.shot_id in only
-            if not redo and shot.shot_id in progress and clip.is_file() and clip.stat().st_size > 0:
+            done = progress.get(shot.shot_id)
+            stale = bool(done) and done.get("fingerprint", fingerprint) != fingerprint
+            if stale:
+                print(f"[{shot.index}/{len(project.shots)}] {shot.shot_id}: storyboard changed, regenerating")
+            if not redo and not stale and done and clip.is_file() and clip.stat().st_size > 0:
                 print(f"[{shot.index}/{len(project.shots)}] {shot.shot_id}: already done")
-            elif only is not None and not redo and clip.is_file():
+            elif only is not None and not redo and not stale and clip.is_file():
                 print(f"[{shot.index}/{len(project.shots)}] {shot.shot_id}: kept")
             else:
                 pictures, chained = self.plan_shot(project, shot, prev_clip, prev_scene, work, dirs)
@@ -358,7 +372,8 @@ class H3ColabRunner:
                 out = self.generate_fn(graph)
                 shutil.copy2(out, clip)
                 progress[shot.shot_id] = {"clip": str(clip), "chained": chained, "seed": shot.seed,
-                                          "seconds": seconds, "elapsed_s": round(time.monotonic() - t0, 1)}
+                                          "seconds": seconds, "elapsed_s": round(time.monotonic() - t0, 1),
+                                          "fingerprint": fingerprint}
                 progress_file.write_text(json.dumps(progress, indent=1, ensure_ascii=False), encoding="utf-8")
             clips.append(clip)
             prev_clip, prev_scene = clip, shot.scene_id

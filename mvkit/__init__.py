@@ -28,6 +28,7 @@ from .script_loader import (
     load_storyboard_from_markdown,
     load_storyboard_from_mvkit_project,
     preview_shot,
+    save_project_json,
     shot_picture_plan,
 )
 from .h3_colab_runner import (
@@ -59,6 +60,21 @@ from .colab_pipeline import (
     probe_media_streams,
     verify_single_audio_stream,
 )
+from .script_import import import_script, import_script_text, parse_freeform_script, read_script_text
+from .alignment import Bible, align_project, apply_bible, format_alignment_report, load_bible
+from .presets import PRESETS, apply_preset
+from .batches import (
+    Batch,
+    approve_batch,
+    assemble_batch_preview,
+    batch_overview,
+    batch_status,
+    check_gate,
+    next_batch,
+    plan_batches,
+    preflight_batch,
+    request_redo,
+)
 
 __all__ = [
     "ASPECT_PRESETS",
@@ -81,6 +97,7 @@ __all__ = [
     "load_storyboard_from_json",
     "load_storyboard_from_markdown",
     "load_storyboard_from_mvkit_project",
+    "save_project_json",
     "preview_shot",
     "shot_picture_plan",
     "AUDIO_VAE",
@@ -106,4 +123,25 @@ __all__ = [
     "normalize_shot_clip",
     "probe_media_streams",
     "verify_single_audio_stream",
+    "import_script",
+    "import_script_text",
+    "parse_freeform_script",
+    "read_script_text",
+    "Bible",
+    "align_project",
+    "apply_bible",
+    "format_alignment_report",
+    "load_bible",
+    "PRESETS",
+    "apply_preset",
+    "Batch",
+    "approve_batch",
+    "assemble_batch_preview",
+    "batch_overview",
+    "batch_status",
+    "check_gate",
+    "next_batch",
+    "plan_batches",
+    "preflight_batch",
+    "request_redo",
 ]

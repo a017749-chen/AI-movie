@@ -67,6 +67,9 @@ class CharacterSpec:
     description: str = ""
     image_path: str = ""
     screen_position: str = ""        # e.g. "left side of frame"
+    aliases: List[str] = field(default_factory=list)   # names the script uses for this person ("考生", "林小姐")
+    voice: str = ""                  # native_h3_audio: the same voice description in every clip
+    lead: bool = False               # speaks the "（口述）" / "（對病人）" lines of the script
 
 
 @dataclass
@@ -74,6 +77,9 @@ class SceneAnchorSpec:
     id: str
     description: str = ""
     image_path: str = ""
+    name: str = ""
+    aliases: List[str] = field(default_factory=list)   # place names the script uses ("病床旁", "治療台")
+    cast: List[str] = field(default_factory=list)      # character ids always present in this scene
 
 
 @dataclass
@@ -117,6 +123,7 @@ class StoryboardProject:
     tail_guard_sec: float = 0.35
     base_seed: int = 768914106098754
     master_audio_path: str = ""
+    preset: str = ""                  # osce_demo | teaching | recruitment (see presets.py)
     style_prefix: str = (
         "Photorealistic cinematic film, natural soft light, stable faces, natural body movement, "
         "restrained camera motion."
@@ -259,8 +266,26 @@ def _character_label(ch: CharacterSpec) -> str:
     if ch.description:
         bits.append(ch.description)
     if ch.screen_position:
-        bits.append(f"always on the {ch.screen_position}")
+        bits.append(f"always in the same place ({ch.screen_position})")
     return ", ".join(bits)
+
+
+def _speaker_phrase(project: StoryboardProject, speaker: str, pictures: List[PictureRef]) -> str:
+    """'The person in <Picture 2> (examinee), in a calm young male voice' when the speaker is a known character.
+
+    Tying the line to the speaker's picture keeps the lips moving on the right face, and repeating the
+    same voice description in every clip keeps the voice from changing between clips.
+    """
+    ch = project.characters.get(speaker)
+    if ch is None:
+        return speaker
+    label = _character_label(ch)
+    who = ch.name
+    for n, pic in enumerate(pictures, start=1):
+        if n > 1 and pic.role == "character" and pic.label == label:
+            who = f"The person in <Picture {n}> ({ch.name})"
+            break
+    return f"{who}, voice: {ch.voice}," if ch.voice else who
 
 
 def build_h3_prompt(project: StoryboardProject, shot: ShotSpec, pictures: List[PictureRef]) -> str:
@@ -298,7 +323,7 @@ def build_h3_prompt(project: StoryboardProject, shot: ShotSpec, pictures: List[P
     if project.audio_mode == "native_h3_audio" and spoken:
         finish = max(1.5, seconds - 1.0)
         if shot.speaker:
-            body.append(f"{shot.speaker} says, starting at 0.4 seconds and finishing by {finish:.1f} seconds: "
+            body.append(f"{_speaker_phrase(project, shot.speaker, pictures)} says, starting at 0.4 seconds and finishing by {finish:.1f} seconds: "
                         f"<d>[Chinese] {spoken}</d> Nobody else speaks.")
         else:
             body.append(f"{project.narrator}, starting at 0.4 seconds and finishing by {finish:.1f} seconds: "
@@ -312,7 +337,10 @@ def build_h3_prompt(project: StoryboardProject, shot: ShotSpec, pictures: List[P
     lines.append("")
     if project.audio_mode == "native_h3_audio":
         sound = project.overall_soundscape.strip()
-        if spoken:
+        speaker = project.characters.get(shot.speaker)
+        if spoken and speaker is not None:
+            sound += f" Only {speaker.name} speaks, with the same voice as in every other clip. No other voices."
+        elif spoken:
             sound += " The same single narrator voice in every clip. No other voices."
         else:
             sound += " No voices."
@@ -466,15 +494,23 @@ def load_storyboard_from_json(data: Any, *, title: str = "AI_Movie", audio_mode:
         if key in meta:
             setattr(p, key, cast(meta[key]))
 
+    if meta.get("preset"):
+        p.preset = str(meta["preset"])
     for cid, c in (meta.get("characters") or {}).items():
         c = c if isinstance(c, dict) else {"description": str(c)}
         p.characters[cid] = CharacterSpec(cid, c.get("name", cid), c.get("description", ""),
-                                          c.get("image_path", ""), c.get("screen_position", ""))
+                                          c.get("image_path", ""), c.get("screen_position", ""),
+                                          list(c.get("aliases") or []), c.get("voice", ""),
+                                          bool(c.get("lead", False)))
     if isinstance(meta.get("scenes"), dict):
         for sid, s in meta["scenes"].items():
             s = s if isinstance(s, dict) else {"description": str(s)}
             p.scenes[sid] = SceneAnchorSpec(sid, s.get("description", ""),
-                                            s.get("image_path", "") or default_reference_image)
+                                            s.get("image_path", "") or default_reference_image,
+                                            s.get("name", ""), list(s.get("aliases") or []),
+                                            list(s.get("cast") or []))
+    for cue in meta.get("subtitle_cues") or []:
+        p.subtitle_cues.append((float(cue[0]), float(cue[1]), str(cue[2])))
 
     for n, it in enumerate(raw_shots, start=1):
         visual = it.get("visual_prompt") or it.get("prompt") or it.get("visual") or it.get("description") or ""
@@ -507,6 +543,14 @@ def load_storyboard_from_json(data: Any, *, title: str = "AI_Movie", audio_mode:
         ))
     _assign_seeds(p)
     return p
+
+
+def save_project_json(project: StoryboardProject, path: str | Path) -> Path:
+    """Snapshot the whole project (bible, presets, seeds) so a later Colab session reloads exactly the same plan."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(project.to_dict(), indent=1, ensure_ascii=False), encoding="utf-8")
+    return path
 
 
 def load_storyboard_from_mvkit_project(project_path: str | Path, *, audio_mode: Optional[str] = None,

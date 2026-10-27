@@ -2,6 +2,17 @@
 
 中文 | [English](../en/RELEASE_NOTES.md)
 
+## 0.7.0（2026-10-28）：教學／招生／OSCE 示範影片：腳本上傳、角色對齊、場景設定、每 2 分鐘確認
+
+- **`script_import.py`**（新）：讀「分鏡 1：… 場景／畫面／對話/口白／動作與評分重點」的自由格式腳本（`.txt`、`.md`、`.docx`、AI Studio 匯出檔），依台詞估秒數，過長台詞在句號處拆成 `03a`、`03b` 並接續尾幀。原本的表格、JSON、`project.py` 照舊。
+- **`alignment.py`**（新）：角色表（別名、外觀、參考圖、站位、聲音、主講）與場景表（別名、描述、參考圖、常駐角色）。每鏡自動對齊場景與角色，角色依固定順序送入 `<Picture 2..>`；`（口述）`、`（對病人）` 判斷說話者；「特寫…」留在原場景。對齊報告列出缺圖與對不到的名稱。
+- **`batches.py`**（新）：分段審核。每段預設 ≤ 2 分鐘、盡量在換場景處切；上一段 `approve` 才能生成下一段；`redo_shots` 換 seed 只重拍指定鏡號；改過的鏡頭自動重拍；預覽影片、審核表、GPU 時間估算；生成前先檢查缺圖。
+- **`presets.py`**（新）：`osce_demo`、`teaching`、`recruitment` 三種用途預設。
+- **`script_loader.py`**：角色多了 `aliases`、`voice`、`lead`，場景多了 `name`、`aliases`、`cast`；說話者有參考圖時 Prompt 指向那張圖並帶入固定聲音；`save_project_json` 存專案快照。
+- **`h3_colab_runner.py`**：`run_storyboard(shot_ids=...)` 只生成一段；`progress.json` 記錄每鏡指紋，內容改過就重拍。
+- Notebook 改為 6 步：工作資料夾預設在 Google Drive、無 GPU 時為規劃模式、生成後可自動中斷執行階段。
+- 文件：新增 `docs/zh-TW/EDU_VIDEO_WORKFLOW.md`、`examples/osce_demo/`。
+
 ## 0.6.1（2026-10-27）：選用的 NVIDIA 顯卡加速，CPU 仍是預設
 
 - **`gpu_check.py`**（新）：看這台機器的 NVIDIA 顯卡能接手哪些步驟，印出要加的環境變數或要裝的套件。沒有顯卡就說全部跑 CPU。

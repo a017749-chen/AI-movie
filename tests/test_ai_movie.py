@@ -28,7 +28,7 @@ def test_colab_notebook_is_valid_and_matches_upstream_comfy():
     nb = json.loads(nb_path.read_text(encoding="utf-8"))
     assert nb["nbformat"] == 4
     code_cells = [c for c in nb["cells"] if c.get("cell_type") == "code"]
-    assert len(code_cells) == 5
+    assert len(code_cells) == 6
     full_code = ""
     for cell in code_cells:
         src = "".join(cell.get("source", []))
