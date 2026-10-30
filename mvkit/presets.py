@@ -27,6 +27,7 @@ PRESETS: Dict[str, Dict[str, str]] = {
         "narrator": "A calm, clear off-screen instructor (S1) speaks in standard Taiwan Mandarin at a measured pace",
         "overall_soundscape": "Quiet clinical skills room tone, soft rustle of gloves and equipment.",
         "continuity_mode": "hybrid",
+        "segment_rule": "10s_3",          # procedures need time: 10 s segments, 3 分鏡 each
     },
     "teaching": {
         "label": "教學影片",
@@ -42,6 +43,7 @@ PRESETS: Dict[str, Dict[str, str]] = {
         "narrator": "A warm, clear off-screen teacher (S1) speaks in standard Taiwan Mandarin at a measured pace",
         "overall_soundscape": "Quiet indoor room tone with soft natural movement sounds.",
         "continuity_mode": "hybrid",
+        "segment_rule": "10s_3",
     },
     "recruitment": {
         "label": "招生影片",
@@ -58,6 +60,7 @@ PRESETS: Dict[str, Dict[str, str]] = {
         "narrator": "An upbeat, sincere off-screen narrator (S1) speaks in standard Taiwan Mandarin",
         "overall_soundscape": "Light ambient hospital atmosphere, gentle footsteps.",
         "continuity_mode": "anchor",
+        "segment_rule": "15s_6",          # fast cutting: 15 s segments, 6 分鏡 each
     },
 }
 

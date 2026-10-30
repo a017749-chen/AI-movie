@@ -86,10 +86,23 @@ def _md_tables(text: str) -> List[tuple]:
 
 
 def _col(headers: List[str], *keys: str) -> int:
+    for k in keys:                       # exact header first: "參考圖" must not pick "其他參考圖"
+        if k in headers:
+            return headers.index(k)
     for i, h in enumerate(headers):
         if any(k in h for k in keys):
             return i
     return -1
+
+
+_TIERS = {"主要": "main", "主角": "main", "男主": "main", "女主": "main", "main": "main",
+          "次要": "secondary", "配角": "secondary", "secondary": "secondary",
+          "路人": "npc", "npc": "npc", "群眾": "npc", "臨演": "npc"}
+
+
+def _tier(cell: str) -> str:
+    c = (cell or "").strip().lower()
+    return next((v for k, v in _TIERS.items() if k in c), "")
 
 
 def parse_bible_markdown(text: str) -> Bible:
@@ -109,6 +122,8 @@ def parse_bible_markdown(text: str) -> Bible:
             c_pos = _col(headers, "位置", "position", "站位")
             c_voice = _col(headers, "聲音", "voice", "嗓音")
             c_lead = _col(headers, "主講", "lead", "主角")
+            c_tier = _col(headers, "等級", "分級", "tier", "層級")
+            c_extra = _col(headers, "其他參考圖", "三視圖", "特寫圖", "extra")
         else:
             c_desc = _col(headers, "描述", "description", "設定", "環境")
             c_cast = _col(headers, "角色", "人物", "cast", "characters")
@@ -122,7 +137,7 @@ def parse_bible_markdown(text: str) -> Bible:
             if is_char:
                 bible.characters[cid] = CharacterSpec(
                     cid, name or cid, get(c_desc), get(c_img), get(c_pos), aliases, get(c_voice),
-                    get(c_lead).lower() in _YES)
+                    get(c_lead).lower() in _YES, _tier(get(c_tier)), _split(get(c_extra)))
             else:
                 bible.scenes[cid] = SceneAnchorSpec(cid, get(c_desc), get(c_img), name or cid, aliases,
                                                     _split(get(c_cast)))
@@ -268,6 +283,16 @@ def align_project(project: StoryboardProject, base_dirs: Optional[List[str | Pat
                 chars.append(addressee)
         if shot.speaker in project.characters:
             chars.append(shot.speaker)
+        for b in shot.beats:                 # segments: every 分鏡 has its own speaker
+            if b.speaker and b.speaker not in project.characters:
+                spk, addressee, ok = resolve_speaker(project, b.speaker)
+                if not ok:
+                    warn.append(f"說話者「{b.speaker}」對不到角色，請在角色表加別名")
+                b.speaker = spk
+                if addressee:
+                    chars.append(addressee)
+            if b.speaker in project.characters:
+                chars.append(b.speaker)
 
         # where: bible scene by name/alias; a framing-only line ("特寫上臂") stays in a room that holds
         # everyone in the shot, preferring the previous shot's room
@@ -318,19 +343,31 @@ def align_project(project: StoryboardProject, base_dirs: Optional[List[str | Pat
     return report
 
 
+def _speakers(shot, name) -> str:
+    if shot.beats:
+        who = [name(b.speaker) if b.speaker else "旁白" for b in shot.beats if b.dialogue]
+        return "、".join(dict.fromkeys(who)) or "—"
+    return name(shot.speaker) if shot.speaker else ("旁白" if shot.dialogue else "—")
+
+
 def format_alignment_report(project: StoryboardProject, report: List[ShotAlignment]) -> str:
     def name(cid: str) -> str:
         ch = project.characters.get(cid)
         return ch.name if ch else cid
 
-    lines = ["| 鏡號 | 秒數 | 場景 | 角色（<Picture 2..> 順序） | 說話者 | 參考圖 |",
-             "| --- | --- | --- | --- | --- | --- |"]
+    from .script_loader import shot_gen_mode
+    mode_zh = {"reference": "參考圖", "reference_keyframes": "參考圖+首幀", "first_frame": "首幀",
+               "first_last": "首尾幀"}
+    lines = ["| 鏡號 | 秒數 | 分鏡 | 模式 | 場景 | 角色（<Picture 2..> 順序） | 說話者 | 參考圖 |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
     by_id = {s.shot_id: s for s in project.shots}
     for r in report:
         shot = by_id[r.shot_id]
-        lines.append(f"| {r.shot_id} | {shot.duration_sec:.1f} | {r.scene_id} | "
+        beats = "→".join(b.framing or "?" for b in shot.beats) or "—"
+        lines.append(f"| {r.shot_id} | {shot.duration_sec:.1f} | {beats} | {mode_zh[shot_gen_mode(project, shot)]} | "
+                     f"{r.scene_id} | "
                      f"{'、'.join(name(c) for c in r.characters) or '—'} | "
-                     f"{name(r.speaker) if r.speaker else ('旁白' if shot.dialogue else '—')} | "
+                     f"{_speakers(shot, name)} | "
                      f"{', '.join(r.pictures) or '（無）'} |")
     grouped: Dict[str, List[str]] = {}
     for r in report:

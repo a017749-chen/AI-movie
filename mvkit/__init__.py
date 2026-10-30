@@ -8,6 +8,9 @@ if _PKG_DIR not in sys.path:
 
 from .script_loader import (
     ASPECT_PRESETS,
+    BeatSpec,
+    shot_engine,
+    shot_gen_mode,
     CharacterSpec,
     H3_FPS,
     H3_MAX_AREA,
@@ -63,6 +66,7 @@ from .colab_pipeline import (
 from .script_import import import_script, import_script_text, parse_freeform_script, read_script_text
 from .alignment import Bible, align_project, apply_bible, format_alignment_report, load_bible
 from .presets import PRESETS, apply_preset
+from .segment_script import SEGMENT_RULES, check_segments, is_segment_script, parse_segment_script
 from .batches import (
     Batch,
     approve_batch,
@@ -134,6 +138,13 @@ __all__ = [
     "load_bible",
     "PRESETS",
     "apply_preset",
+    "SEGMENT_RULES",
+    "check_segments",
+    "is_segment_script",
+    "parse_segment_script",
+    "BeatSpec",
+    "shot_engine",
+    "shot_gen_mode",
     "Batch",
     "approve_batch",
     "assemble_batch_preview",

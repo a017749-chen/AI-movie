@@ -119,6 +119,29 @@ def build_cues_from_storyboard(
         shot_end = cursor + dur
         cursor = shot_end
 
+        if shot.beats:
+            # segments: every 分鏡's line is timed inside that 分鏡's own window
+            scale = dur / max(0.01, sum(b.duration_sec for b in shot.beats))
+            b_start = shot_start
+            for b in shot.beats:
+                b_end = b_start + b.duration_sec * scale
+                b_clauses = split_chinese_clauses(b.dialogue.strip(), max_chars=max_chars_per_line)
+                if b_clauses:
+                    u0 = b_start + min(0.3, b.duration_sec * 0.1)
+                    u1 = max(u0 + 0.4, b_end - min(0.2, b.duration_sec * 0.1))
+                    total_w = sum(max(2, len(c)) for c in b_clauses)
+                    t_cur = u0
+                    for i_c, clause in enumerate(b_clauses):
+                        t_next = u1 if i_c == len(b_clauses) - 1 else round(
+                            t_cur + (u1 - u0) * max(2, len(clause)) / total_w, 3)
+                        cues.append(SubtitleCue(index=cue_idx, start_sec=round(t_cur, 3),
+                                                end_sec=round(max(t_cur + 0.25, t_next), 3), text=clause,
+                                                shot_id=shot.shot_id))
+                        cue_idx += 1
+                        t_cur = t_next
+                b_start = b_end
+            continue
+
         raw_text = (shot.subtitle_text or shot.dialogue or "").strip()
         clauses = split_chinese_clauses(raw_text, max_chars=max_chars_per_line)
         if not clauses:

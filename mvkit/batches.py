@@ -23,7 +23,15 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from .script_loader import ShotSpec, StoryboardProject, shot_picture_plan
+from .script_loader import (
+    ShotSpec,
+    StoryboardProject,
+    _resolve_path,
+    framing_en,
+    shot_engine,
+    shot_gen_mode,
+    shot_picture_plan,
+)
 
 DEFAULT_BATCH_SECONDS = 120.0
 REVIEW_FILE = "review_state.json"
@@ -39,7 +47,7 @@ class Batch:
     def label(self) -> str:
         m0, s0 = divmod(int(self.start_sec), 60)
         m1, s1 = divmod(int(self.start_sec + self.seconds), 60)
-        return f"第 {self.index} 段（{m0:02d}:{s0:02d}–{m1:02d}:{s1:02d}，{len(self.shot_ids)} 鏡）"
+        return f"第 {self.index} 批（{m0:02d}:{s0:02d}–{m1:02d}:{s1:02d}，{len(self.shot_ids)} 支片段）"
 
 
 def plan_batches(project: StoryboardProject, max_seconds: float = DEFAULT_BATCH_SECONDS) -> List[Batch]:
@@ -69,7 +77,8 @@ def plan_batches(project: StoryboardProject, max_seconds: float = DEFAULT_BATCH_
 def shot_fingerprint(project: StoryboardProject, shot: ShotSpec) -> str:
     """Hash of everything that changes the generated clip (text, seed, pictures, project-wide prompt text)."""
     keys = ("style_prefix", "continuity_rules", "negative_rules", "narrator", "overall_soundscape",
-            "audio_mode", "inference_mode", "width", "height", "tail_guard_sec", "continuity_mode")
+            "audio_mode", "inference_mode", "width", "height", "tail_guard_sec", "continuity_mode",
+            "ref_image_size")
     d = {k: getattr(project, k) for k in keys}
     d["shot"] = {k: v for k, v in asdict(shot).items() if k not in ("index", "title", "subtitle_text", "notes")}
     scene = project.scenes.get(shot.scene_id)
@@ -146,7 +155,7 @@ def check_gate(project: StoryboardProject, work_dir: str | Path, batches: Sequen
         st = batch_status(project, work_dir, b)
         if st != "approved":
             raise RuntimeError(f"{b.label()} 尚未確認（狀態：{st}）。請先在審核步驟按「approve」或指定重拍鏡號，"
-                               f"確認無誤後再生成下一段，避免浪費 Colab 運算單元。")
+                               f"確認無誤後再生成下一批，避免浪費 Colab 運算單元。")
 
 
 def approve_batch(project: StoryboardProject, work_dir: str | Path, batch: Batch, note: str = "") -> None:
@@ -171,12 +180,21 @@ def chained_dependents(project: StoryboardProject, shot_id: str) -> List[str]:
         return out
     i = ids.index(shot_id)
     for prev, s in zip(project.shots[i:], project.shots[i + 1:]):
-        mode = s.continuity_override or project.continuity_mode
-        if mode == "chain_last_frame" or (mode == "hybrid" and s.scene_id == prev.scene_id):
+        if _chains(project, prev, s):
             out.append(s.shot_id)
         else:
             break
     return out
+
+
+def _chains(project: StoryboardProject, prev: ShotSpec, s: ShotSpec) -> bool:
+    """Does `s` start from `prev`'s last frame? (mirrors H3ColabRunner.plan_generation)"""
+    if s.first_frame:
+        return False
+    if prev.end_framing and s.start_framing and framing_en(prev.end_framing) != framing_en(s.start_framing):
+        return False
+    mode = s.continuity_override or project.continuity_mode
+    return mode == "chain_last_frame" or (mode == "hybrid" and s.scene_id == prev.scene_id)
 
 
 def request_redo(project: StoryboardProject, work_dir: str | Path, shot_ids: Sequence[str], *,
@@ -224,11 +242,23 @@ def preflight_batch(project: StoryboardProject, batch: Batch, base_dirs: Optiona
     for i, s in enumerate(shots):
         if s.shot_id not in batch.shot_ids:
             continue
-        mode = s.continuity_override or project.continuity_mode
-        can_chain = i > 0 and (mode == "chain_last_frame" or (mode == "hybrid" and shots[i - 1].scene_id == s.scene_id))
-        if not shot_picture_plan(project, s, dirs) and not can_chain:
+        can_chain = i > 0 and _chains(project, shots[i - 1], s)
+        mode = shot_gen_mode(project, s)
+        for raw, what in ((s.first_frame, "首幀圖"), (s.last_frame, "尾幀圖")):
+            if raw and not Path(_resolve_path(raw, dirs)).is_file():
+                problems.append(f"{s.shot_id}: {what} {raw} 找不到（請在 Step 2 上傳）")
+        if mode == "first_last" and not s.last_frame:
+            problems.append(f"{s.shot_id}: 首尾幀模式需要「尾幀圖」")
+        if mode == "reference_keyframes" and not (s.first_frame or s.last_frame):
+            problems.append(f"{s.shot_id}: 參考圖+首幀模式需要「首幀圖」或「尾幀圖」")
+        if not shot_picture_plan(project, s, dirs) and not can_chain and not s.first_frame:
             problems.append(f"{s.shot_id}: 沒有任何參考圖（場景 {s.scene_id} 需要 <Picture 1>）")
     return problems
+
+
+def engines_for(project: StoryboardProject, batch: Batch) -> List[str]:
+    """H3 models this batch needs ('reference' = Ref2VA, 'first_frame' = FL2VA)."""
+    return sorted({shot_engine(project, s) for s in project.shots if s.shot_id in batch.shot_ids})
 
 
 def estimate_gpu_minutes(project: StoryboardProject, work_dir: str | Path,
@@ -256,7 +286,7 @@ def write_review_checklist(project: StoryboardProject, batch: Batch, path: str |
     if preview:
         lines += [f"- 預覽影片：`{preview.get('subtitled_mp4') or preview.get('clean_mp4')}`",
                   f"- 抽幀檢視圖：`{preview.get('review_sheet')}`", ""]
-    lines += ["每鏡請確認：角色長相/服裝一致 · 場景與道具一致 · 動作/技術步驟正確 · 台詞與口型正確 · "
+    lines += ["每支片段請確認：角色長相/服裝一致 · 場景與道具一致 · 動作/技術步驟正確 · 台詞與口型正確 · "
               "沒有多餘人物、文字或變形的手。", "",
               "| 鏡號 | 秒數 | 角色 | 台詞 | 評分重點 / 備註 | 結果 |", "| --- | --- | --- | --- | --- | --- |"]
     for s in project.shots:
@@ -264,6 +294,9 @@ def write_review_checklist(project: StoryboardProject, batch: Batch, path: str |
             who = "、".join(names.get(c, c) for c in s.characters) or "—"
             lines.append(f"| {s.shot_id} | {s.duration_sec:.1f} | {who} | {s.dialogue or '—'} | "
                          f"{s.notes or '—'} | ☐ 通過 ☐ 重拍 |")
+            for b in s.beats:
+                lines.append(f"| ↳ {b.beat_id} {b.framing} | {b.duration_sec:.1f} | | {b.dialogue or '—'} | "
+                             f"{b.visual[:40]} | |")
     lines += ["", "全部通過 → 審核步驟選 `approve`；有問題 → 選 `redo_shots` 並填入要重拍的鏡號（逗號分隔）。"]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
@@ -312,6 +345,6 @@ def all_approved(project: StoryboardProject, work_dir: str | Path, batches: Sequ
 
 
 def batch_overview(project: StoryboardProject, work_dir: str | Path, batches: Sequence[Batch]) -> str:
-    icon = {"approved": "✅ 已確認", "generated": "👀 待審核", "partial": "⏳ 生成中斷", "pending": "⬜ 未生成"}
+    icon = {"approved": "✅ 已確認", "generated": "👀 待審核", "partial": "⏳ 部分完成", "pending": "⬜ 未生成"}
     return "\n".join(f"{icon[batch_status(project, work_dir, b)]}  {b.label()}  {', '.join(b.shot_ids)}"
                      for b in batches)

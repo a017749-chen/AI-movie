@@ -37,6 +37,14 @@ from typing import Any, Dict, List, Optional, Tuple
 VALID_AUDIO_MODES = ("native_h3_audio", "clip_voiceover", "master_audio")
 VALID_CONTINUITY_MODES = ("hybrid", "chain_last_frame", "anchor")
 VALID_INFERENCE_MODES = ("reference", "first_frame")
+# per-segment generation modes -> the H3 model they need
+GEN_MODE_ENGINE = {
+    "reference": "reference",            # Ref2VA: scene + character pictures
+    "reference_keyframes": "reference",  # Ref2VA + MiniMaxH3AddGuide pinning a first and/or last keyframe
+    "first_frame": "first_frame",        # FL2VA with a first frame
+    "first_last": "first_frame",         # FL2VA with first and last frame
+}
+CHARACTER_TIERS = ("main", "secondary", "npc")
 
 H3_FPS = 24
 H3_MAX_AREA = 1344 * 768
@@ -70,6 +78,8 @@ class CharacterSpec:
     aliases: List[str] = field(default_factory=list)   # names the script uses for this person ("考生", "林小姐")
     voice: str = ""                  # native_h3_audio: the same voice description in every clip
     lead: bool = False               # speaks the "（口述）" / "（對病人）" lines of the script
+    tier: str = ""                   # main | secondary | npc: decides who keeps a picture when slots run out
+    extra_images: List[str] = field(default_factory=list)   # turnaround sheet, face close-up (main characters)
 
 
 @dataclass
@@ -80,6 +90,21 @@ class SceneAnchorSpec:
     name: str = ""
     aliases: List[str] = field(default_factory=list)   # place names the script uses ("病床旁", "治療台")
     cast: List[str] = field(default_factory=list)      # character ids always present in this scene
+
+
+@dataclass
+class BeatSpec:
+    """One 分鏡 inside a segment: H3 renders all beats of a segment as cuts inside ONE clip."""
+    beat_id: str
+    duration_sec: float = 3.0
+    framing: str = ""                 # 遠景 | 全景 | 中景 | 近景 | 特寫
+    lighting: str = ""                # 色調打光
+    visual: str = ""                  # 畫面描述
+    dialogue: str = ""                # 旁白對白 (spoken words only)
+    speaker: str = ""                 # character id after alignment, "" = narrator
+    sound: str = ""                   # 音效配樂
+    camera: str = ""                  # 運鏡
+    missing_fields: List[str] = field(default_factory=list)   # modules the script did not write
 
 
 @dataclass
@@ -100,13 +125,26 @@ class ShotSpec:
     seed: int = 0
     continuity_override: str = ""     # "anchor" | "chain_last_frame" for this shot only
     notes: str = ""
+    beats: List[BeatSpec] = field(default_factory=list)   # segment = several 分鏡 cut inside one clip
+    gen_mode: str = ""                # "" = project.inference_mode; see GEN_MODE_ENGINE
+    first_frame: str = ""             # keyframe picture pinned at frame 0 (融圖 key frame)
+    last_frame: str = ""              # keyframe picture pinned at the last frame
+
+    @property
+    def start_framing(self) -> str:
+        return self.beats[0].framing if self.beats else ""
+
+    @property
+    def end_framing(self) -> str:
+        return self.beats[-1].framing if self.beats else ""
 
 
 @dataclass
 class PictureRef:
     path: str
-    role: str                         # "scene" | "character" | "chain" | "extra"
+    role: str                         # "scene" | "character" | "chain" | "extra" | "keyframe"
     label: str                        # sentence used in the prompt
+    char_id: str = ""
 
 
 @dataclass
@@ -186,6 +224,16 @@ class StoryboardProject:
                     f"({longest:.2f}s after the {self.tail_guard_sec}s tail guard) - split it into two rows")
             if s.continuity_override and s.continuity_override not in ("anchor", "chain_last_frame"):
                 errors.append(f"shot {s.shot_id}: continuity_override must be 'anchor' or 'chain_last_frame'")
+            if s.gen_mode and s.gen_mode not in GEN_MODE_ENGINE:
+                errors.append(f"shot {s.shot_id}: gen_mode must be one of {sorted(GEN_MODE_ENGINE)}")
+            if s.gen_mode == "first_last" and not s.last_frame:
+                errors.append(f"shot {s.shot_id}: 首尾幀模式需要尾幀圖 (last_frame)")
+            if s.beats and abs(sum(b.duration_sec for b in s.beats) - s.duration_sec) > 0.05:
+                errors.append(f"shot {s.shot_id}: beats add up to {sum(b.duration_sec for b in s.beats):.2f}s "
+                              f"but the segment keeps {s.duration_sec:.2f}s")
+        for c in self.characters.values():
+            if c.tier and c.tier not in CHARACTER_TIERS:
+                errors.append(f"character {c.id}: tier must be one of {CHARACTER_TIERS}")
         if errors:
             raise ValueError("Storyboard problems:\n  - " + "\n  - ".join(errors))
 
@@ -220,11 +268,41 @@ def _resolve_path(p: str, base_dirs: List[Path]) -> str:
     return p
 
 
+FRAMING_EN = {
+    "大特寫": "extreme close-up", "特寫": "close-up", "近景": "medium close-up", "中近景": "medium close-up",
+    "中景": "medium shot", "全景": "full shot", "遠景": "extreme wide establishing shot",
+    "大遠景": "extreme wide establishing shot",
+}
+_TIER_RANK = {"main": 0, "secondary": 1, "": 1, "npc": 2}
+
+
+def framing_en(framing: str) -> str:
+    f = (framing or "").strip()
+    for zh in sorted(FRAMING_EN, key=len, reverse=True):
+        if zh in f:
+            return FRAMING_EN[zh]
+    return f
+
+
+def shot_gen_mode(project: StoryboardProject, shot: ShotSpec) -> str:
+    if shot.gen_mode:
+        return shot.gen_mode
+    return "first_frame" if project.inference_mode == "first_frame" else "reference"
+
+
+def shot_engine(project: StoryboardProject, shot: ShotSpec) -> str:
+    """Which H3 model a shot needs: 'reference' (Ref2VA) or 'first_frame' (FL2VA)."""
+    return GEN_MODE_ENGINE[shot_gen_mode(project, shot)]
+
+
 def shot_picture_plan(project: StoryboardProject, shot: ShotSpec,
                       base_dirs: Optional[List[Path]] = None) -> List[PictureRef]:
     """Ordered pictures for a shot: <Picture 1> scene/start frame, then character sheets (Ref2VA only).
 
-    Missing files are dropped here so the prompt never mentions a picture the graph does not receive.
+    With more characters than picture slots (9 including the scene), main characters keep their pictures
+    first, then secondary, then NPCs (who fall back to words); main characters' extra views (turnaround,
+    face close-up) only take slots that are left. Missing files are dropped so the prompt never mentions
+    a picture the graph does not receive.
     """
     base_dirs = [Path(b) for b in (base_dirs or []) if b]
     plan: List[PictureRef] = []
@@ -235,13 +313,13 @@ def shot_picture_plan(project: StoryboardProject, shot: ShotSpec,
 
     if shot.reference_images:
         char_by_file = {Path(c.image_path).name: c for c in project.characters.values() if c.image_path}
-        for i, raw in enumerate(shot.reference_images):
+        for raw in shot.reference_images:
             p = _resolve_path(raw, base_dirs)
             if not exists(p):
                 continue
             ch = char_by_file.get(Path(p).name)
             if ch:
-                plan.append(PictureRef(p, "character", _character_label(ch)))
+                plan.append(PictureRef(p, "character", _character_label(ch), ch.id))
             elif not plan:
                 plan.append(PictureRef(p, "scene", "the scene, people and composition"))
             else:
@@ -251,12 +329,23 @@ def shot_picture_plan(project: StoryboardProject, shot: ShotSpec,
             desc = scene.description or "the scene"
             plan.append(PictureRef(_resolve_path(scene.image_path, base_dirs), "scene",
                                    f"the scene and composition ({desc})"))
-        for cid in shot.characters:
-            ch = project.characters.get(cid)
-            if ch and exists(_resolve_path(ch.image_path, base_dirs)):
-                plan.append(PictureRef(_resolve_path(ch.image_path, base_dirs), "character", _character_label(ch)))
+        slots = MAX_REFERENCE_IMAGES - len(plan)
+        order = {cid: i for i, cid in enumerate(shot.characters)}
+        cast = [project.characters[c] for c in shot.characters if c in project.characters]
+        with_pic = [ch for ch in cast if exists(_resolve_path(ch.image_path, base_dirs))]
+        chosen = sorted(with_pic, key=lambda ch: (_TIER_RANK.get(ch.tier, 1), order[ch.id]))[:slots]
+        chosen.sort(key=lambda ch: order[ch.id])
+        for ch in chosen:
+            plan.append(PictureRef(_resolve_path(ch.image_path, base_dirs), "character", _character_label(ch), ch.id))
+        for ch in chosen:
+            if ch.tier != "main":
+                continue
+            for raw in ch.extra_images:
+                p = _resolve_path(raw, base_dirs)
+                if exists(p) and len(plan) < MAX_REFERENCE_IMAGES:
+                    plan.append(PictureRef(p, "extra", f"another view of {ch.name}", ch.id))
 
-    if project.inference_mode == "first_frame":
+    if shot_engine(project, shot) == "first_frame":
         plan = plan[:1]
     return plan[:MAX_REFERENCE_IMAGES]
 
@@ -270,8 +359,15 @@ def _character_label(ch: CharacterSpec) -> str:
     return ", ".join(bits)
 
 
+def _picture_of(pictures: List[PictureRef], char_id: str, label: str = "") -> int:
+    for n, pic in enumerate(pictures, start=1):
+        if n > 1 and pic.role == "character" and (pic.char_id == char_id or (label and pic.label == label)):
+            return n
+    return 0
+
+
 def _speaker_phrase(project: StoryboardProject, speaker: str, pictures: List[PictureRef]) -> str:
-    """'The person in <Picture 2> (examinee), in a calm young male voice' when the speaker is a known character.
+    """'The person in <Picture 2> (examinee), voice: a calm young male voice,' for a known character.
 
     Tying the line to the speaker's picture keeps the lips moving on the right face, and repeating the
     same voice description in every clip keeps the voice from changing between clips.
@@ -279,76 +375,163 @@ def _speaker_phrase(project: StoryboardProject, speaker: str, pictures: List[Pic
     ch = project.characters.get(speaker)
     if ch is None:
         return speaker
-    label = _character_label(ch)
-    who = ch.name
-    for n, pic in enumerate(pictures, start=1):
-        if n > 1 and pic.role == "character" and pic.label == label:
-            who = f"The person in <Picture {n}> ({ch.name})"
-            break
+    n = _picture_of(pictures, ch.id, _character_label(ch))
+    who = f"The person in <Picture {n}> ({ch.name})" if n else ch.name
     return f"{who}, voice: {ch.voice}," if ch.voice else who
 
 
-def build_h3_prompt(project: StoryboardProject, shot: ShotSpec, pictures: List[PictureRef]) -> str:
-    """Compose the full H3 prompt for one clip. `pictures` must be the exact list fed to the graph."""
+def _music_from(sound: str) -> str:
+    """'環境音：病房；配樂：輕柔鋼琴' -> '輕柔鋼琴' ('無' / 'none' -> '')."""
+    m = re.search(r"(?:配樂|音樂|music)\s*[：:]?\s*([^；;。\n]+)", sound or "", flags=re.I)
+    if not m:
+        return ""
+    music = m.group(1).strip()
+    return "" if re.fullmatch(r"(無|none|n/?a|沒有|不需要)", music, flags=re.I) else music
+
+
+def _ambient(sound: str) -> str:
+    """Sound effects only; the 配樂 part goes to non_diegetic_music."""
+    s = re.sub(r"[；;，,]?\s*(?:配樂|音樂|music)\s*[：:]?[^；;。\n]*", "", sound or "", flags=re.I)
+    return s.strip(" ；;，,。.")
+
+
+def _speech(project: StoryboardProject, speaker: str, spoken: str, start: float, finish: float,
+            pictures: List[PictureRef]) -> str:
+    if speaker:
+        return (f"{_speaker_phrase(project, speaker, pictures)} says, starting at {start:.1f} seconds and "
+                f"finishing by {finish:.1f} seconds: <d>[Chinese] {spoken}</d> Nobody else speaks.")
+    return (f"{project.narrator}, starting at {start:.1f} seconds and finishing by {finish:.1f} seconds: "
+            f"<d>[Chinese] {spoken}</d> The on-screen people do not speak; their lips stay relaxed.")
+
+
+def _voices_line(project: StoryboardProject, speakers: List[str]) -> str:
+    named = [project.characters[s].name for s in dict.fromkeys(speakers) if s in project.characters]
+    if not speakers:
+        return " No voices."
+    if len(named) == 1 and len(set(speakers)) == 1:
+        return f" Only {named[0]} speaks, with the same voice as in every other clip. No other voices."
+    if named:
+        who = ", ".join(named) + (" and the narrator" if "" in speakers else "")
+        return f" Only {who} speak, each with the same voice as in every other clip. No other voices."
+    return " The same single narrator voice in every clip. No other voices."
+
+
+def build_h3_prompt(project: StoryboardProject, shot: ShotSpec, pictures: List[PictureRef], *,
+                    opening: Optional[bool] = None, end_picture: int = 0) -> str:
+    """Compose the full H3 prompt for one clip. `pictures` must be the exact list fed to the graph.
+
+    opening      True: <Picture 1> is the clip's first frame ("fully referenced at 0.00 s"); False: it is only
+                 a reference for the place (the first frame is pinned by a keyframe, or the clip opens on a
+                 closer framing than the scene picture). None decides from the first beat's framing.
+    end_picture  FL2VA first+last mode: the picture number of the last frame.
+
+    A segment (shot with beats) is written as consecutive [Shot k] cuts, each with its own time window,
+    framing, lighting, action, line and sound - all generated as one clip. The fixed assets (setting,
+    people) come first so every clip starts from the same description.
+    """
     seconds = project.generation_seconds(shot)
     lines: List[str] = []
+    if opening is None:
+        first = framing_en(shot.start_framing)
+        opening = (not first or "wide" in first or "full shot" in first
+                   or bool(pictures and pictures[0].role == "chain"))
 
     if pictures:
-        lines.append("For the target video, at 0.00 seconds into the target video, "
-                     "<Picture 1> (from [Shot 1]) is fully referenced.")
-        if len(pictures) > 1:
-            refs = []
-            for n, pic in enumerate(pictures[1:], start=2):
-                refs.append(f"<Picture {n}> shows {pic.label}; keep this person's face, hair and clothing identical.")
+        if opening:
+            lines.append("For the target video, at 0.00 seconds into the target video, "
+                         "<Picture 1> (from [Shot 1]) is fully referenced.")
+        else:
+            lines.append("<Picture 1> shows the setting (room layout, furniture and lighting); use it as a "
+                         "reference for the place, not as the opening frame.")
+        if end_picture:
+            last_beat = len(shot.beats) or 1
+            lines.append(f"At {seconds - 0.05:.2f} seconds into the target video, <Picture {end_picture}> "
+                         f"(from [Shot {last_beat}]) is fully referenced.")
+        refs = []
+        for n, pic in enumerate(pictures[1:], start=2):
+            if n == end_picture:
+                continue
+            same = ""
+            if pic.role == "extra" and pic.char_id:
+                k = _picture_of(pictures, pic.char_id)
+                same = f" (the same person as <Picture {k}>)" if k else ""
+            refs.append(f"<Picture {n}> shows {pic.label}{same}; keep this person's face, hair and clothing identical.")
+        if refs:
             lines.append(" ".join(refs))
         lines.append("")
 
-    body: List[str] = [project.style_prefix.strip()]
+    body: List[str] = []
     scene = project.scenes.get(shot.scene_id) or project.scenes.get("default")
     if scene and scene.description:
         body.append(f"Setting: {scene.description}.")
-    if project.inference_mode == "first_frame" or len(pictures) <= 1:
-        # characters have no picture of their own: describe them in words
-        for cid in shot.characters:
-            ch = project.characters.get(cid)
-            if ch:
-                body.append(f"{_character_label(ch)}.")
-    body.append(shot.visual_prompt.strip().rstrip("。.") + ".")
-    if shot.camera_motion:
-        body.append(f"Camera: {shot.camera_motion.strip().rstrip('。.')}.")
-    if pictures:
-        body.append(project.continuity_rules)
+    pictured = {p.char_id for p in pictures if p.char_id}
+    for cid in shot.characters:
+        ch = project.characters.get(cid)
+        if ch and cid not in pictured:            # no picture of their own: describe them in words
+            body.append(f"{_character_label(ch)}.")
+    body.append(project.style_prefix.strip())
 
-    spoken = clean_dialogue(shot.dialogue)
-    if project.audio_mode == "native_h3_audio" and spoken:
-        finish = max(1.5, seconds - 1.0)
-        if shot.speaker:
-            body.append(f"{_speaker_phrase(project, shot.speaker, pictures)} says, starting at 0.4 seconds and finishing by {finish:.1f} seconds: "
-                        f"<d>[Chinese] {spoken}</d> Nobody else speaks.")
-        else:
-            body.append(f"{project.narrator}, starting at 0.4 seconds and finishing by {finish:.1f} seconds: "
-                        f"<d>[Chinese] {spoken}</d> The on-screen people do not speak; their lips stay relaxed.")
-        body.append("Hold the final pose silently for the last second.")
+    native = project.audio_mode == "native_h3_audio"
+    speakers: List[str] = []
+    action: List[str] = []
+    if shot.beats:
+        t = 0.0
+        for k, b in enumerate(shot.beats, start=1):
+            head = f"[Shot {k}] {t:.1f}-{t + b.duration_sec:.1f} seconds"
+            if b.framing:
+                head += f", {framing_en(b.framing)}"
+            parts = [head + ":"]
+            if b.lighting:
+                parts.append(f"Lighting and colour: {b.lighting.strip().rstrip('。.')}.")
+            if b.visual:
+                parts.append(b.visual.strip().rstrip("。.") + ".")
+            if b.camera:
+                parts.append(f"Camera: {b.camera.strip().rstrip('。.')}.")
+            spoken = clean_dialogue(b.dialogue)
+            if native and spoken:
+                finish = t + b.duration_sec - 0.3
+                if k == len(shot.beats):         # leave the silent last second
+                    finish = min(finish, seconds - 1.0)
+                parts.append(_speech(project, b.speaker, spoken, t + 0.3, max(t + 0.8, finish), pictures))
+                speakers.append(b.speaker)
+            elif native:
+                parts.append("No one speaks in this shot.")
+            ambient = _ambient(b.sound)
+            if native and ambient:
+                parts.append(f"Sound: {ambient}.")
+            action.append(" ".join(parts))
+            t += b.duration_sec
+        if not native:
+            action.append("Nobody speaks: no dialogue, no narration, no singing; lips stay relaxed.")
+        elif speakers:
+            action.append("Hold the final pose silently for the last second.")
     else:
-        body.append("Nobody speaks: no dialogue, no narration, no singing; lips stay relaxed.")
-    body.append(project.negative_rules)
-
-    lines.append("integrated_multimodal_description: [Shot 1] " + " ".join(b for b in body if b))
-    lines.append("")
-    if project.audio_mode == "native_h3_audio":
-        sound = project.overall_soundscape.strip()
-        speaker = project.characters.get(shot.speaker)
-        if spoken and speaker is not None:
-            sound += f" Only {speaker.name} speaks, with the same voice as in every other clip. No other voices."
-        elif spoken:
-            sound += " The same single narrator voice in every clip. No other voices."
+        action.append(shot.visual_prompt.strip().rstrip("。.") + ".")
+        if shot.camera_motion:
+            action.append(f"Camera: {shot.camera_motion.strip().rstrip('。.')}.")
+        spoken = clean_dialogue(shot.dialogue)
+        if native and spoken:
+            action.append(_speech(project, shot.speaker, spoken, 0.4, max(1.5, seconds - 1.0), pictures))
+            action.append("Hold the final pose silently for the last second.")
+            speakers.append(shot.speaker)
         else:
-            sound += " No voices."
+            action.append("Nobody speaks: no dialogue, no narration, no singing; lips stay relaxed.")
+
+    tail: List[str] = [project.continuity_rules] if pictures else []
+    tail.append(project.negative_rules)
+    lines.append("integrated_multimodal_description: " + ("" if shot.beats else "[Shot 1] ")
+                 + " ".join(x for x in body + action + tail if x))
+    lines.append("")
+    if native:
+        sound = project.overall_soundscape.strip() + _voices_line(project, speakers)
     else:
         sound = "Quiet room tone only. No speech, no voices, no music."
     lines.append("overall_soundscape: " + sound)
     lines.append("")
-    lines.append("non_diegetic_music: N/A")
+    music = ""
+    if native and shot.beats:
+        music = next((m for m in (_music_from(b.sound) for b in shot.beats) if m), "")
+    lines.append("non_diegetic_music: " + (music or "N/A"))
     return "\n".join(lines)
 
 
@@ -501,7 +684,8 @@ def load_storyboard_from_json(data: Any, *, title: str = "AI_Movie", audio_mode:
         p.characters[cid] = CharacterSpec(cid, c.get("name", cid), c.get("description", ""),
                                           c.get("image_path", ""), c.get("screen_position", ""),
                                           list(c.get("aliases") or []), c.get("voice", ""),
-                                          bool(c.get("lead", False)))
+                                          bool(c.get("lead", False)), str(c.get("tier", "")),
+                                          list(c.get("extra_images") or []))
     if isinstance(meta.get("scenes"), dict):
         for sid, s in meta["scenes"].items():
             s = s if isinstance(s, dict) else {"description": str(s)}
@@ -540,9 +724,21 @@ def load_storyboard_from_json(data: Any, *, title: str = "AI_Movie", audio_mode:
             seed=int(it.get("seed", 0)),
             continuity_override=str(it.get("continuity_override", "")),
             notes=str(it.get("notes", "")),
+            beats=[_beat_from_dict(b) for b in it.get("beats") or []],
+            gen_mode=str(it.get("gen_mode", "")),
+            first_frame=str(it.get("first_frame", "")),
+            last_frame=str(it.get("last_frame", "")),
         ))
     _assign_seeds(p)
     return p
+
+
+def _beat_from_dict(b: Dict[str, Any]) -> BeatSpec:
+    return BeatSpec(beat_id=str(b.get("beat_id", "")), duration_sec=float(b.get("duration_sec", 3.0)),
+                    framing=str(b.get("framing", "")), lighting=str(b.get("lighting", "")),
+                    visual=str(b.get("visual", "")), dialogue=str(b.get("dialogue", "")),
+                    speaker=str(b.get("speaker", "")), sound=str(b.get("sound", "")),
+                    camera=str(b.get("camera", "")), missing_fields=list(b.get("missing_fields") or []))
 
 
 def save_project_json(project: StoryboardProject, path: str | Path) -> Path:
