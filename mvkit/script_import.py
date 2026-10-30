@@ -3,9 +3,7 @@
 Segment scripts (`段落 1（0–10 秒）` + `分鏡 1-1｜全景｜3 秒` with the four modules) are handled by
 `segment_script.py`; the older free-form layout below still works.
 
-Older free-form layout: upload a free-form script (teaching / recruitment / OSCE demo) and turn it into a storyboard.
-
-Accepted files:
+Accepted files for the older layout:
   * `.txt` / `.md` written as numbered shots, e.g.
 
         第一幕：準備與溝通
