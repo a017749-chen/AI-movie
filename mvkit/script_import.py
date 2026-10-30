@@ -1,6 +1,9 @@
-"""Upload a free-form script (teaching / recruitment / OSCE demo) and turn it into a storyboard.
+"""Upload a script (teaching / recruitment / OSCE demo) and turn it into a storyboard.
 
-Accepted files:
+Segment scripts (`段落 1（0–10 秒）` + `分鏡 1-1｜全景｜3 秒` with the four modules) are handled by
+`segment_script.py`; the older free-form layout below still works.
+
+Accepted files for the older layout:
   * `.txt` / `.md` written as numbered shots, e.g.
 
         第一幕：準備與溝通
@@ -310,7 +313,12 @@ def import_script(source: str | Path, *, title: Optional[str] = None, audio_mode
 
 def import_script_text(text: str, *, title: str = "AI_Movie", audio_mode: Optional[str] = None,
                        continuity_mode: Optional[str] = None, default_reference_image: str = "") -> StoryboardProject:
-    """Pasted text: a storyboard table goes to the table loader, anything else is parsed as a free-form script."""
+    """Pasted text: segment scripts (段落 1 …) -> segment parser, a storyboard table -> the table loader,
+    anything else -> the free-form shot parser."""
+    from .segment_script import is_segment_script, parse_segment_script, segments_to_project
+    if is_segment_script(text):
+        return segments_to_project(parse_segment_script(text), title=title, audio_mode=audio_mode,
+                                   continuity_mode=continuity_mode, default_reference_image=default_reference_image)
     if is_storyboard_table(text) and not any(_SHOT_HEAD.match(ln) for ln in text.splitlines()):
         from .script_loader import load_storyboard_from_markdown
         return load_storyboard_from_markdown(text, title=title, audio_mode=audio_mode,

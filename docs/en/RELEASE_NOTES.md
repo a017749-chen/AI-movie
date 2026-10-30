@@ -2,6 +2,16 @@
 
 [中文](../zh-TW/RELEASE_NOTES.md) | English
 
+## 0.8.0 (2026-10-30): segment scripts, first/last-frame modes, character tiers, draft/final
+
+- **`segment_script.py`** (new): bullet-list scripts. `段落 N（start–end 秒｜mode）` holds `分鏡 N-M｜framing｜seconds` beats, each with lighting, visual, line and sound; "同上" repeats the previous beat. `10s_3` / `15s_6` checks: segment length, beat count, missing modules, lines too long for their beat. 15 s segments keep 14.65 s.
+- **Cuts inside one clip**: a segment is one H3 clip written as `[Shot k] start-end seconds, framing:`; lines and subtitles stay inside their beat; music goes to `non_diegetic_music`.
+- **Generation modes** per segment: reference, reference + keyframes (Ref2VA + `MiniMaxH3AddGuide`), first frame, first + last frame (FL2VA `last_frame`). The runner picks the model per segment and downloads only what a batch needs; segments chain only when the framing matches; a segment that does not open wide uses the scene picture as a place reference only.
+- **Character tiers**: bible columns for tier (main / secondary / NPC) and extra pictures (turnaround, face close-up); the 9 picture slots go by tier and unpictured people are described in words.
+- **Draft / final**: `QUALITY=draft` uses `ref_image_size=match`, `final` uses `max` with the draft's seeds.
+- Prompts put the fixed assets first; `examples/script_prompt_template.md`; `examples/osce_demo/segments.txt`.
+- Checked against ComfyUI (2026-10-29): there is no "MiniMax H3 Low VRAM" node; the Turbo LoRAs stay at 4 / 8 steps.
+
 ## 0.7.0 (2026-10-28): teaching / recruitment / OSCE demo videos: script upload, character and scene bible, 2-minute review batches
 
 - **`script_import.py`** (new): reads free-form scripts ("分鏡 1：…" with 場景／畫面／對話/口白／動作與評分重點) from `.txt`, `.md`, `.docx` and AI Studio exports, estimates durations from the spoken line and splits lines too long for one clip into chained `03a`, `03b`. Tables, JSON and `project.py` load as before.

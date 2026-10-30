@@ -9,11 +9,20 @@ All models are downloaded directly into Colab's local disk (`/content/ComfyUI/mo
   RandomNoise + KSamplerSelect + BasicScheduler -> SamplerCustomAdvanced
   VAEDecode + VAEDecodeAudio -> VHS_VideoCombine (h264 mp4 with ONE audio stream)
 
+Generation modes per segment (`ShotSpec.gen_mode`, see script_loader.GEN_MODE_ENGINE):
+  reference            Ref2VA, scene + character pictures
+  reference_keyframes  Ref2VA + MiniMaxH3AddGuide pinning a first and/or last keyframe (experimental)
+  first_frame          FL2VA with a first frame
+  first_last           FL2VA with first_frame + last_frame
+Ref2VA and FL2VA are different diffusion models; only the ones a batch needs are downloaded.
+
 Continuity between clips:
   anchor           every clip starts from the locked scene picture.
   hybrid           inside the same scene_id the previous clip's last clean frame (before tail_guard) becomes
                    <Picture 1>; character sheets stay as <Picture 2..>. A new scene_id resets to the anchor.
   chain_last_frame always chain from the previous clip.
+  Segments only chain when the next one opens on the same framing (景別) the previous one ended on;
+  otherwise the next clip starts from the scene picture or its own keyframe.
 """
 from __future__ import annotations
 
@@ -31,9 +40,13 @@ from .script_loader import (
     PictureRef,
     ShotSpec,
     StoryboardProject,
+    _resolve_path,
     build_h3_prompt,
     check_picture_tags,
+    framing_en,
     h3_frames,
+    shot_engine,
+    shot_gen_mode,
     shot_picture_plan,
 )
 
@@ -91,8 +104,14 @@ def choose_models(mode: str, cuda_version: str, capability: tuple) -> ModelSet:
 def build_h3_graph(*, models: ModelSet, prompt: str, width: int, height: int, seconds: float, seed: int,
                    picture_names: List[str], ref_image_size: str = "max", lora_strength: float = 1.0,
                    sampler: str = "euler", scheduler: str = "beta", crf: int = 18,
-                   filename_prefix: str = "ai_movie") -> Dict[str, Any]:
-    """ComfyUI API graph for one clip (mirrors the upstream notebook's graph)."""
+                   filename_prefix: str = "ai_movie",
+                   keyframes: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """ComfyUI API graph for one clip (mirrors the upstream notebook's graph).
+
+    keyframes {"first": name, "last": name}: Ref2VA pins them with MiniMaxH3AddGuide at frame 0 / the last
+    frame; FL2VA feeds "last" to the node's last_frame input (the first frame is picture_names[0]).
+    """
+    keyframes = {k: v for k, v in (keyframes or {}).items() if v}
     frames = h3_frames(seconds)
     g: Dict[str, Any] = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": models.diffusion, "weight_dtype": "default"}},
@@ -113,6 +132,14 @@ def build_h3_graph(*, models: ModelSet, prompt: str, width: int, height: int, se
             g[nid] = {"class_type": "LoadImage", "inputs": {"image": name}}
             inputs[f"ref_images.ref_image_{i}"] = [nid, 0]
         g["7"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": inputs}
+        positive = ["7", 0]
+        for nid, img_id, key, idx in (("20", "30", "first", 0), ("21", "31", "last", -1)):
+            if key in keyframes:
+                g[img_id] = {"class_type": "LoadImage", "inputs": {"image": keyframes[key]}}
+                g[nid] = {"class_type": "MiniMaxH3AddGuide", "inputs": {
+                    "positive": positive, "vae": ["4", 0], "latent": ["7", 1], "image": [img_id, 0],
+                    "frame_idx": idx}}
+                positive = [nid, 0]
     else:
         if len(picture_names) != 1:
             raise ValueError("FL2VA needs exactly one first-frame picture")
@@ -122,8 +149,14 @@ def build_h3_graph(*, models: ModelSet, prompt: str, width: int, height: int, se
         g["7"] = {"class_type": "MiniMaxH3ImageToVideo", "inputs": {
             "clip": ["3", 0], "vae": ["4", 0], "first_frame": ["16", 0], "prompt": prompt,
             "width": width, "height": height, "length": frames}}
+        if "last" in keyframes:
+            g["17"] = {"class_type": "LoadImage", "inputs": {"image": keyframes["last"]}}
+            g["18"] = {"class_type": "ImageScaleToTotalPixels", "inputs": {
+                "image": ["17", 0], "upscale_method": "nearest-exact", "megapixels": 0.98, "resolution_steps": 32}}
+            g["7"]["inputs"]["last_frame"] = ["18", 0]
+        positive = ["7", 0]
     g.update({
-        "8": {"class_type": "BasicGuider", "inputs": {"model": ["2", 0], "conditioning": ["7", 0]}},
+        "8": {"class_type": "BasicGuider", "inputs": {"model": ["2", 0], "conditioning": positive}},
         "9": {"class_type": "RandomNoise", "inputs": {"noise_seed": int(seed)}},
         "10": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": sampler}},
         "11": {"class_type": "BasicScheduler",
@@ -156,6 +189,16 @@ def extract_clean_continuity_frame(video_path: str | Path, output_png: str | Pat
     return output_png
 
 
+@dataclass
+class GenerationPlan:
+    mode: str                         # reference | reference_keyframes | first_frame | first_last
+    engine: str                       # model set: reference | first_frame
+    pictures: List[PictureRef]
+    keyframes: Dict[str, str]         # {"first"/"last": local path}
+    chained: bool
+    prompt: str
+
+
 class H3ColabRunner:
     """Drives a ComfyUI server on the Colab VM with models stored directly in `/content/ComfyUI/models`."""
 
@@ -165,25 +208,36 @@ class H3ColabRunner:
         self.comfy_dir = Path(comfy_dir)
         self.base_url = base_url.rstrip("/")
         self.models = models
+        self.model_sets: Dict[str, ModelSet] = {models.mode: models} if models else {}
         self.log_path = Path(log_path)
         self.process: Optional[subprocess.Popen] = None
         self.generate_fn: Callable[..., Path] = self._generate_with_comfy
 
     # ------------------------------------------------------------------ models
     def detect_models(self, mode: str) -> ModelSet:
+        """Pick the model files for one engine ('reference' or 'first_frame'); call once per engine needed."""
         import torch
         assert torch.cuda.is_available(), "Colab: Runtime > Change runtime type > GPU (A100 recommended)"
-        self.models = choose_models(mode, torch.version.cuda or "0", torch.cuda.get_device_capability(0))
-        return self.models
+        ms = choose_models(mode, torch.version.cuda or "0", torch.cuda.get_device_capability(0))
+        self.model_sets[mode] = ms
+        if self.models is None or self.models.mode == mode:
+            self.models = ms
+        return ms
+
+    def _sets(self) -> Dict[str, ModelSet]:
+        if self.models is not None and self.models.mode not in self.model_sets:
+            self.model_sets[self.models.mode] = self.models
+        return self.model_sets
 
     def ensure_models(self) -> Dict[str, str]:
-        """Download required H3 model weights directly into `/content/ComfyUI/models`."""
+        """Download the weights of every detected model set directly into `/content/ComfyUI/models`."""
         from huggingface_hub import hf_hub_download
 
-        assert self.models, "call detect_models() first"
+        assert self._sets(), "call detect_models() first"
         models_root = self.comfy_dir / "models"
         found: Dict[str, str] = {}
-        for repo, remote, folder in self.models.files():
+        files = list(dict.fromkeys(f for ms in self._sets().values() for f in ms.files()))
+        for repo, remote, folder in files:
             name = Path(remote).name
             target = models_root / folder / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -234,8 +288,11 @@ class H3ColabRunner:
         need = {"UNETLoader", "CLIPLoader", "VAELoader", "LoraLoaderModelOnly", "LoadImage", "BasicGuider",
                 "RandomNoise", "KSamplerSelect", "BasicScheduler", "SamplerCustomAdvanced", "VAEDecode",
                 "VAEDecodeAudio", "VHS_VideoCombine"}
-        need |= {"MiniMaxH3ReferenceToVideo"} if self.models and self.models.mode == "reference" else \
-            {"MiniMaxH3ImageToVideo", "ImageScaleToTotalPixels"}
+        modes = set(self._sets()) or {"reference"}
+        if "reference" in modes:
+            need |= {"MiniMaxH3ReferenceToVideo"}
+        if "first_frame" in modes:
+            need |= {"MiniMaxH3ImageToVideo", "ImageScaleToTotalPixels"}
         missing = need - set(info)
         if missing:
             raise RuntimeError(f"ComfyUI is missing nodes {sorted(missing)}; update ComfyUI / VideoHelperSuite "
@@ -260,6 +317,12 @@ class H3ColabRunner:
 
     def _generate_with_comfy(self, graph: Dict[str, Any], timeout_sec: float = 7200) -> Path:
         import requests
+        info = getattr(self, "object_info", None)
+        if info:
+            missing = {n["class_type"] for n in graph.values()} - set(info)
+            if missing:
+                raise RuntimeError(f"this ComfyUI has no {sorted(missing)} node; update ComfyUI (git pull) to use "
+                                   f"keyframe modes, or switch the segment to 參考圖 mode")
         r = requests.post(self.base_url + "/prompt", json={"prompt": graph, "client_id": "ai-movie"}, timeout=60)
         if not r.ok:
             raise RuntimeError(f"ComfyUI rejected the graph (HTTP {r.status_code}): {r.text[:2000]}")
@@ -290,25 +353,67 @@ class H3ColabRunner:
         raise TimeoutError(f"prompt {pid} took longer than {timeout_sec}s")
 
     # ------------------------------------------------------------------ storyboard
-    def plan_shot(self, project: StoryboardProject, shot: ShotSpec, prev_clip: Optional[Path],
-                  prev_scene: Optional[str], work_dir: Path, base_dirs: List[Path]) -> tuple:
-        """Return (pictures, chained) for a shot, applying the continuity mode."""
+    def plan_generation(self, project: StoryboardProject, shot: ShotSpec, prev_clip: Optional[Path],
+                        prev_shot: Optional[ShotSpec], work_dir: Path, base_dirs: List[Path]) -> "GenerationPlan":
+        """Pictures, keyframes and prompt for one clip, applying the generation and continuity modes."""
+        mode, engine = shot_gen_mode(project, shot), shot_engine(project, shot)
         plan = shot_picture_plan(project, shot, base_dirs)
-        mode = shot.continuity_override or project.continuity_mode
-        chain = prev_clip is not None and prev_clip.is_file() and (
-            mode == "chain_last_frame" or (mode == "hybrid" and prev_scene == shot.scene_id))
-        if chain:
-            png = extract_clean_continuity_frame(prev_clip, work_dir / "chain_frames" / f"{shot.index:02d}_start.png",
-                                                 tail_guard_sec=project.tail_guard_sec)
-            start = PictureRef(str(png), "chain", "the last frame of the previous clip")
-            rest = [p for p in plan if p.role == "character"]
-            plan = [start] + rest
-        if not plan:
+        cont = shot.continuity_override or project.continuity_mode
+        same_framing = not (prev_shot and prev_shot.end_framing and shot.start_framing) or \
+            framing_en(prev_shot.end_framing) == framing_en(shot.start_framing)
+        chain = prev_clip is not None and prev_clip.is_file() and prev_shot is not None and same_framing and (
+            cont == "chain_last_frame" or (cont == "hybrid" and prev_shot.scene_id == shot.scene_id))
+
+        def keyframe(raw: str, what: str) -> str:
+            if not raw:
+                return ""
+            path = _resolve_path(raw, base_dirs)
+            if not Path(path).is_file():
+                raise FileNotFoundError(f"shot {shot.shot_id}: {what} {raw!r} not found in {base_dirs}")
+            return path
+
+        first_kf, last_kf = keyframe(shot.first_frame, "首幀圖"), keyframe(shot.last_frame, "尾幀圖")
+        chain_png = ""
+        if chain and not first_kf:
+            chain_png = str(extract_clean_continuity_frame(
+                prev_clip, work_dir / "chain_frames" / f"{shot.index:02d}_start.png",
+                tail_guard_sec=project.tail_guard_sec))
+        chained = bool(chain_png)
+        keyframes: Dict[str, str] = {}
+        end_picture = 0
+        opening: Optional[bool] = None
+        if engine == "reference":
+            if chain_png:
+                plan = [PictureRef(chain_png, "chain", "the last frame of the previous clip")] + \
+                       [p for p in plan if p.role in ("character", "extra") and p.char_id]
+            if mode == "reference_keyframes":
+                keyframes = {k: v for k, v in (("first", first_kf), ("last", last_kf)) if v}
+                if first_kf:
+                    opening = False                     # frame 0 is pinned by the guide, not by <Picture 1>
+            pictures = plan[:9]
+        else:
+            first = first_kf or chain_png or (plan[0].path if plan else "")
+            pictures = [PictureRef(first, "keyframe" if first_kf else ("chain" if chain_png else "scene"),
+                                   "the opening frame")] if first else []
+            opening = True
+            if mode == "first_last":
+                if not last_kf:
+                    raise ValueError(f"shot {shot.shot_id}: 首尾幀模式需要尾幀圖")
+                keyframes = {"last": last_kf}
+                end_picture = 2                          # FL2VA hands the text encoder [first, last]
+        if not pictures:
             raise ValueError(f"shot {shot.shot_id}: no picture found. Upload a scene/first-frame picture or set "
                              f"reference_images; H3 Ref2VA/FL2VA both need at least one image")
-        if project.inference_mode == "first_frame":
-            plan = plan[:1]
-        return plan[:9], chain
+        prompt = build_h3_prompt(project, shot, pictures, opening=opening, end_picture=end_picture)
+        check_picture_tags(prompt, len(pictures) + (1 if end_picture else 0))
+        return GenerationPlan(mode, engine, pictures, keyframes, chained, prompt)
+
+    def plan_shot(self, project: StoryboardProject, shot: ShotSpec, prev_clip: Optional[Path],
+                  prev_scene: Optional[str], work_dir: Path, base_dirs: List[Path]) -> tuple:
+        """Backwards-compatible wrapper: (pictures, chained)."""
+        prev = ShotSpec(shot_id="_prev", index=0, scene_id=prev_scene or "") if prev_scene is not None else None
+        gp = self.plan_generation(project, shot, prev_clip, prev, work_dir, base_dirs)
+        return gp.pictures, gp.chained
 
     def run_storyboard(self, project: StoryboardProject, work_dir: str | Path, *,
                        base_dirs: Optional[List[str | Path]] = None, resume: bool = True,
@@ -322,10 +427,12 @@ class H3ColabRunner:
         A clip whose shot was edited (text, seed, pictures, bible entry) since it was made is regenerated.
         """
         project.validate()
-        assert self.models, "call detect_models() first"
-        if self.models.mode != project.inference_mode:
-            raise ValueError(f"models were prepared for {self.models.mode!r} but storyboard uses "
-                             f"{project.inference_mode!r}; re-run the model cell")
+        assert self._sets(), "call detect_models() first"
+        scope = [s for s in project.shots if shot_ids is None or s.shot_id in shot_ids]
+        need = {shot_engine(project, s) for s in scope}
+        if need - set(self._sets()):
+            raise ValueError(f"these shots need the {sorted(need - set(self._sets()))} model(s) but only "
+                             f"{sorted(self._sets())} were prepared; re-run the model cell")
         work = Path(work_dir)
         clips_dir = work / "raw_clips"
         clips_dir.mkdir(parents=True, exist_ok=True)
@@ -336,12 +443,12 @@ class H3ColabRunner:
 
         clips: List[Path] = []
         prev_clip: Optional[Path] = None
-        prev_scene: Optional[str] = None
+        prev_shot: Optional[ShotSpec] = None
         for shot in project.shots:
             clip = clips_dir / f"{shot.index:02d}_{shot.shot_id}.mp4"
             if shot_ids is not None and shot.shot_id not in shot_ids:
                 have = clip.is_file() and clip.stat().st_size > 0
-                prev_clip, prev_scene = (clip if have else None), shot.scene_id
+                prev_clip, prev_shot = (clip if have else None), shot
                 continue
             fingerprint = shot_fingerprint(project, shot)
             redo = only is not None and shot.shot_id in only
@@ -354,27 +461,30 @@ class H3ColabRunner:
             elif only is not None and not redo and not stale and clip.is_file():
                 print(f"[{shot.index}/{len(project.shots)}] {shot.shot_id}: kept")
             else:
-                pictures, chained = self.plan_shot(project, shot, prev_clip, prev_scene, work, dirs)
-                prompt = build_h3_prompt(project, shot, pictures)
-                check_picture_tags(prompt, len(pictures))
+                gp = self.plan_generation(project, shot, prev_clip, prev_shot, work, dirs)
+                pictures, chained = gp.pictures, gp.chained
+                prompt = gp.prompt
                 names = [self.stage_picture(p.path, f"aimovie_{shot.index:02d}_{i:02d}.png")
                          for i, p in enumerate(pictures)]
+                kf_names = {k: self.stage_picture(v, f"aimovie_{shot.index:02d}_kf_{k}.png")
+                            for k, v in gp.keyframes.items()}
                 seconds = project.generation_seconds(shot)
-                graph = build_h3_graph(models=self.models, prompt=prompt, width=project.width,
+                graph = build_h3_graph(models=self._sets()[gp.engine], prompt=prompt, width=project.width,
                                        height=project.height, seconds=seconds, seed=shot.seed,
                                        picture_names=names, ref_image_size=project.ref_image_size,
-                                       filename_prefix=f"aimovie_{shot.index:02d}")
+                                       filename_prefix=f"aimovie_{shot.index:02d}", keyframes=kf_names)
                 (work / "prompts").mkdir(exist_ok=True)
                 (work / "prompts" / f"{shot.index:02d}_{shot.shot_id}.txt").write_text(prompt, encoding="utf-8")
-                print(f"[{shot.index}/{len(project.shots)}] {shot.shot_id}: {seconds:.2f}s, "
-                      f"{len(pictures)} picture(s), chained={chained}", flush=True)
+                print(f"[{shot.index}/{len(project.shots)}] {shot.shot_id}: {seconds:.2f}s, {gp.mode}, "
+                      f"{len(pictures)} picture(s), keyframes={sorted(gp.keyframes) or '-'}, chained={chained}",
+                      flush=True)
                 t0 = time.monotonic()
                 out = self.generate_fn(graph)
                 shutil.copy2(out, clip)
-                progress[shot.shot_id] = {"clip": str(clip), "chained": chained, "seed": shot.seed,
+                progress[shot.shot_id] = {"clip": str(clip), "chained": chained, "seed": shot.seed, "mode": gp.mode,
                                           "seconds": seconds, "elapsed_s": round(time.monotonic() - t0, 1),
                                           "fingerprint": fingerprint}
                 progress_file.write_text(json.dumps(progress, indent=1, ensure_ascii=False), encoding="utf-8")
             clips.append(clip)
-            prev_clip, prev_scene = clip, shot.scene_id
+            prev_clip, prev_shot = clip, shot
         return clips
