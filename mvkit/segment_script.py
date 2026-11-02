@@ -13,6 +13,8 @@ Written as bullet text (no tables), every 分鏡 with the four modules and a 景
     ...
 
 Segment lines (before its first 分鏡): 場景, 角色, 模式, 首幀圖, 尾幀圖, 色調打光 (default for its 分鏡).
+Optional 分鏡 line `出場：考生、病人` (or `出場：無`) says exactly who is visible; without it the alignment
+infers it from the 畫面描述 and the speaker. A cue like `（考生畫外）` / `（考生OS）` makes the line a voice-over.
 Mode words in the header or `模式：` - 參考圖 (default) | 參考圖+首幀 / 首幀鎖定 | 首幀 | 首尾幀.
 
 Rules (`check_segments`): `10s_3` = 10 s segments with at least 3 分鏡, `15s_6` = 15 s with at least 6;
@@ -49,6 +51,8 @@ _LABELS = [
     ("配樂", "music"), ("sound", "sound"), ("music", "music"),
     ("畫面色調打光", "lighting"), ("色調與打光", "lighting"), ("色調打光", "lighting"), ("畫面色調", "lighting"),
     ("色調", "lighting"), ("打光", "lighting"), ("光線", "lighting"), ("lighting", "lighting"),
+    ("出場人物", "cast"), ("畫面人物", "cast"), ("入鏡人物", "cast"), ("出場", "cast"), ("入鏡", "cast"),
+    ("on screen", "cast"), ("cast", "cast"),
     ("分鏡畫面描述", "visual"), ("畫面描述", "visual"), ("視頻提示詞", "visual"), ("影片提示詞", "visual"),
     ("提示詞", "visual"), ("畫面", "visual"), ("visual", "visual"), ("prompt", "visual"),
     ("旁白對白", "dialogue"), ("旁白/對白", "dialogue"), ("旁白／對白", "dialogue"), ("對白旁白", "dialogue"),
@@ -179,7 +183,7 @@ _SAME = re.compile(r"^\s*(同上一鏡|同前一鏡|同上|同前|same as above)
 def _inherit(beat: Dict[str, str], prev: Dict[str, str]) -> Dict[str, str]:
     """`色調打光：同上，臉部受光均勻` -> the previous 分鏡's lighting + '，臉部受光均勻'."""
     out = dict(beat)
-    for key in ("lighting", "sound", "visual", "camera", "framing"):
+    for key in ("lighting", "sound", "visual", "camera", "framing", "cast"):
         v = out.get(key, "")
         m = _SAME.match(v)
         if m:
@@ -227,9 +231,10 @@ def segments_to_project(segs: List[_Draft], *, title: str = "AI_Movie", audio_mo
             missing = [zh for key, zh in REQUIRED.items()
                        if not {"framing": framing, "lighting": lighting, "visual": b.get("visual", ""),
                                "dialogue": "dialogue" in b, "sound": sound}[key]]
+            cast = [c for c in re.split(r"[,;，；、/／\s]+", b.get("cast", "") or b.get("characters", "")) if c]
             beats.append(BeatSpec(beat_id=b.get("_id") or f"{sd.number}-{k}", duration_sec=sec, framing=framing,
                                   lighting=lighting, visual=b.get("visual", ""), dialogue=spoken, speaker=cue,
-                                  sound=sound, camera=b.get("camera", ""), missing_fields=missing))
+                                  sound=sound, camera=b.get("camera", ""), missing_fields=missing, cast=cast))
         mode = parse_mode(f.get("mode", "") or sd.header)
         if not mode and (f.get("first_frame") or f.get("last_frame")):
             mode = "first_last" if f.get("last_frame") and "首幀" not in sd.header else "reference_keyframes"
@@ -242,7 +247,7 @@ def segments_to_project(segs: List[_Draft], *, title: str = "AI_Movie", audio_mo
             visual_prompt=" ".join(b.visual for b in beats if b.visual) or heading or f"segment {sid}",
             dialogue="".join(b.dialogue for b in beats),
             subtitle_text="",
-            characters=[c for c in re.split(r"[,;，；、\s]+", f.get("characters", "")) if c],
+            characters=[c for c in re.split(r"[,;，；、\s]+", f.get("characters", "") or f.get("cast", "")) if c],
             notes=heading,
             beats=beats,
             gen_mode=mode,

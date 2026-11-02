@@ -251,9 +251,97 @@ class ShotAlignment:
     warnings: List[str]
 
 
+OFFSCREEN_MARKS = ("畫外音", "畫面外", "畫外", "內心", "o.s.", "v.o.", "os", "vo")
+WIDE_FRAMINGS = ("遠景", "全景", "wide", "full shot", "establishing")
+
+
+def split_offscreen(cue: str) -> tuple:
+    """'考生畫外' -> ('考生', True); '考生OS' -> ('考生', True); '對病人' -> ('對病人', False)."""
+    c = (cue or "").strip()
+    low = c.lower()
+    for m in OFFSCREEN_MARKS:
+        if m in ("os", "vo"):
+            if low.endswith(m) and (len(low) == len(m) or not low[-len(m) - 1].isascii()
+                                    or not low[-len(m) - 1].isalpha()):
+                return c[:len(c) - len(m)].strip(" -_/、,，"), True
+            continue
+        if m in low:
+            i = low.index(m)
+            return (c[:i] + c[i + len(m):]).strip(" -_/、,，"), True
+    return c, False
+
+
+def _resolve_names(project: StoryboardProject, names: List[str], warn: List[str]) -> List[str]:
+    out: List[str] = []
+    for c in names:
+        cid = c if c in project.characters else find_character(project, c)
+        if cid:
+            out.append(cid)
+        elif not re.fullmatch(r"(無|none|沒有人|無人|—|-)", c.strip(), flags=re.I):
+            warn.append(f"角色「{c}」不在角色表")
+    return out
+
+
+def _mentioned(project: StoryboardProject, text: str) -> List[str]:
+    return [cid for cid, ch in project.characters.items()
+            if any(len(n) >= 2 and n in (text or "") for n in _names(ch))]
+
+
+def _resolve_cue(project: StoryboardProject, cue: str, warn: List[str]) -> tuple:
+    """Script cue -> (speaker id or "", addressee id or None, voice_over forced?)."""
+    raw, off = split_offscreen(cue)
+    if off and not raw:                  # （OS）/（畫外音） alone: the off-screen narrator, as before
+        return "", None, True
+    if raw in project.characters:
+        return raw, None, off
+    spk, addressee, ok = resolve_speaker(project, raw)
+    if not ok:
+        warn.append(f"說話者「{raw}」對不到角色，請在角色表加別名")
+    return spk, addressee, off
+
+
+def align_beat_cast(project: StoryboardProject, beat, segment_cast: List[str], fallback_cast: List[str],
+                    warn: List[str]) -> None:
+    """Decide who is VISIBLE in one 分鏡 and whether its line is a voice-over.
+
+    * `出場：考生、病人` written in the 分鏡 wins (`出場：無` = nobody on screen).
+    * otherwise: people named in the 畫面描述, the speaker (unless it is a hands / instrument close-up or the
+      cue says 畫外), and the person spoken to in a wide or medium shot;
+    * a wide shot that names nobody shows the segment's `角色：` (or the scene's cast).
+    Only visible people get a reference picture, so a close-up never drags the whole cast into frame.
+    """
+    from .script_loader import is_detail_beat
+
+    detail = is_detail_beat(beat)
+    framing = (beat.framing or "").lower()
+    wide = any(w in framing for w in WIDE_FRAMINGS)
+    spk, addressee, off = "", None, False
+    if beat.speaker and beat.speaker not in project.characters:
+        spk, addressee, off = _resolve_cue(project, beat.speaker, warn)
+        beat.speaker = spk
+    if beat.cast:
+        vis = _resolve_names(project, beat.cast, warn)
+    else:
+        vis = _mentioned(project, beat.visual)
+        if beat.speaker in project.characters and not detail and not off:
+            vis.append(beat.speaker)
+        if addressee and not detail:
+            vis.append(addressee)
+        if not vis and wide:
+            vis = list(segment_cast or fallback_cast)
+    order = {cid: i for i, cid in enumerate(project.characters)}
+    beat.on_screen = sorted(dict.fromkeys(vis), key=lambda c: order.get(c, 99))
+    beat.voice_over = bool(beat.speaker) and (off or detail or beat.speaker not in beat.on_screen)
+
+
 def align_project(project: StoryboardProject, base_dirs: Optional[List[str | Path]] = None
                   ) -> List[ShotAlignment]:
-    """Rewrite scene_id / characters / speaker of every shot against the bible. Returns a per-shot report."""
+    """Rewrite scene_id / characters / speaker of every shot against the bible. Returns a per-shot report.
+
+    `shot.characters` ends up as the people VISIBLE somewhere in the clip (the union of its 分鏡), in bible
+    order. They - and only they - get `<Picture 2..>`; a scene's full cast is no longer added to every clip,
+    because H3 Ref2VA tends to paint every person it is shown (extra / duplicated people).
+    """
     dirs = [Path(b) for b in (base_dirs or []) if b]
     order = {cid: i for i, cid in enumerate(project.characters)}
     real_scenes = [s for s in project.scenes if s != "default"]
@@ -262,37 +350,7 @@ def align_project(project: StoryboardProject, base_dirs: Optional[List[str | Pat
 
     for shot in project.shots:
         warn: List[str] = []
-        # who is in the shot: listed names, names mentioned in the text, the speaker and who they talk to
-        chars: List[str] = []
-        for c in shot.characters:
-            cid = c if c in project.characters else find_character(project, c)
-            if cid:
-                chars.append(cid)
-            else:
-                warn.append(f"角色「{c}」不在角色表")
-        haystack = " ".join((shot.title, shot.visual_prompt, shot.dialogue))
-        for cid, ch in project.characters.items():
-            if any(len(n) >= 2 and n in haystack for n in _names(ch)):
-                chars.append(cid)
-        if shot.speaker and shot.speaker not in project.characters:
-            spk, addressee, ok = resolve_speaker(project, shot.speaker)
-            if not ok:
-                warn.append(f"說話者「{shot.speaker}」對不到角色，請在角色表加別名")
-            shot.speaker = spk
-            if addressee:
-                chars.append(addressee)
-        if shot.speaker in project.characters:
-            chars.append(shot.speaker)
-        for b in shot.beats:                 # segments: every 分鏡 has its own speaker
-            if b.speaker and b.speaker not in project.characters:
-                spk, addressee, ok = resolve_speaker(project, b.speaker)
-                if not ok:
-                    warn.append(f"說話者「{b.speaker}」對不到角色，請在角色表加別名")
-                b.speaker = spk
-                if addressee:
-                    chars.append(addressee)
-            if b.speaker in project.characters:
-                chars.append(b.speaker)
+        listed = _resolve_names(project, shot.characters, warn)
 
         # where: bible scene by name/alias; a framing-only line ("特寫上臂") stays in a room that holds
         # everyone in the shot, preferring the previous shot's room
@@ -300,7 +358,8 @@ def align_project(project: StoryboardProject, base_dirs: Optional[List[str | Pat
         sid = find_scene(project, raw_scene) if raw_scene else None
         if sid is None and raw_scene and is_framing(raw_scene):
             shot.camera_motion = ", ".join(x for x in (raw_scene, shot.camera_motion) if x)
-            fits = [x for x in real_scenes if set(chars) <= set(project.scenes[x].cast)]
+            people = listed + _mentioned(project, shot.visual_prompt)
+            fits = [x for x in real_scenes if set(people) <= set(project.scenes[x].cast)]
             sid = prev_scene if prev_scene in fits or not fits else fits[0]
             sid = sid or (real_scenes[0] if real_scenes else "default")
         elif sid is None and raw_scene:
@@ -319,12 +378,37 @@ def align_project(project: StoryboardProject, base_dirs: Optional[List[str | Pat
         shot.scene_id = sid
         prev_scene = sid
         scene = project.scenes.get(sid)
-        if scene:
-            chars += [c for c in scene.cast if c in project.characters]
+        scene_cast = [c for c in (scene.cast if scene else []) if c in project.characters]
+
+        chars: List[str] = []
+        if shot.beats:
+            for b in shot.beats:
+                align_beat_cast(project, b, listed, scene_cast, warn)
+                chars += b.on_screen
+        else:
+            # one-cut shots: listed + named people, the speaker and who they talk to; the scene's cast
+            # only when the shot names nobody at all
+            chars = listed + _mentioned(project, " ".join((shot.title, shot.visual_prompt, shot.dialogue)))
+            if shot.speaker and shot.speaker not in project.characters:
+                spk, addressee, off = _resolve_cue(project, shot.speaker, warn)
+                shot.speaker = spk
+                if addressee:
+                    chars.append(addressee)
+            if shot.speaker in project.characters:
+                chars.append(shot.speaker)
+            if not chars:
+                chars = scene_cast
 
         shot.characters = sorted(dict.fromkeys(chars), key=lambda c: order.get(c, 99))
         if len(shot.characters) > MAX_REFERENCE_IMAGES - 1:
             warn.append(f"{len(shot.characters)} 位角色超過 H3 參考圖上限（場景圖 + 8 人），只送前 8 位")
+        if len(shot.characters) >= 4:
+            warn.append(f"同一支片段有 {len(shot.characters)} 人入鏡，人越多越容易重複或換臉；可考慮拆段或用「出場：」限定")
+
+        from .script_loader import shot_gen_mode
+        if shot_gen_mode(project, shot) in ("first_frame", "first_last") and not shot.first_frame \
+                and shot.beats and shot.beats[0].on_screen:
+            warn.append("首幀/首尾幀模式沒有「首幀圖」：會用場景圖當第一格，人物可能憑空出現或重複；建議指定首幀圖")
 
         pics: List[str] = []
         sc_img = _resolve_path(scene.image_path, dirs) if scene else ""
@@ -339,7 +423,8 @@ def align_project(project: StoryboardProject, base_dirs: Optional[List[str | Pat
                 pics.append(Path(img).name)
             else:
                 warn.append(f"角色 {cid} 沒有參考圖：長相只靠文字描述，跨鏡容易跑掉")
-        report.append(ShotAlignment(shot.shot_id, sid, list(shot.characters), shot.speaker, pics, warn))
+        report.append(ShotAlignment(shot.shot_id, sid, list(shot.characters), shot.speaker, pics,
+                                    list(dict.fromkeys(warn))))
     return report
 
 

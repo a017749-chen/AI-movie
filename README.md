@@ -7,8 +7,10 @@
 1. **🛡️ 畫面連貫不跑掉（Visual Continuity & Anti-Drift）**
    - **對齊官方 ComfyUI 節點與模型庫**：使用官方 [`Comfy-Org/ComfyUI`](https://github.com/Comfy-Org/ComfyUI) 的 `MiniMaxH3ReferenceToVideo`（Ref2VA，支援 1–9 張參照圖 `ref_images.ref_image_0..8`）與 `MiniMaxH3ImageToVideo`（FL2VA 首幀模式），搭配 `Comfy-Org/MiniMax-H3` 及 `drbaph/MiniMax-H3-Turbo-Lora-ComfyUI` 權重，自動依 CUDA 版本與 GPU 架構選擇 `int8_convrot`、`fp8_scaled` 或 `bf16`。
    - **官方畫布與影格對齊**：預設採用官方 `1344×768`（16:9，長寬皆為 32 倍數且不超過 `1344×768` 上限），24 fps 影格數嚴格對齊 `17k + 5`（單鏡最短 5 秒／124 幀、最長 15 秒／362 幀）。
-   - **跨鏡自動接續乾淨尾幀（`continuity_mode = "hybrid" | "chain_last_frame" | "anchor"`）**：同一場戲內，系統自動在 `tail_guard`（預設裁除最後 `0.35s` 易變形閃白尾幀）之前擷取最後一張穩定畫面作為下一鏡的 `<Picture 1>`，同時保留 `<Picture 2..N>` 角色設定圖；跨場時自動重置回乾淨場景基準圖。
-   - **色彩與影格正規化**：所有分鏡統一轉為相同解析度、24 fps、`yuv420p` 與 `bt709` 色彩空間。
+   - **只送入鏡的人、寫明人數（0.9.0）**：每個分鏡判斷誰在畫面上（腳本可寫 `出場：`），只有入鏡的人送角色圖，Prompt 寫明「畫面上剛好 N 人、每人只出現一次」；特寫手部的台詞自動改成畫外音。避免人物重複出現。詳見 [`docs/zh-TW/ARCHITECTURE_REVIEW.md`](docs/zh-TW/ARCHITECTURE_REVIEW.md)。
+   - **連貫模式（`continuity_mode = "anchor"（預設） | "hybrid" | "chain_last_frame"`）**：`anchor` 每段都從同一組場景＋角色圖出發；`hybrid` 同場景內接上一段 `tail_guard`（預設 `0.35s`）之前的乾淨尾幀，並在 Prompt 寫明尾幀裡的人就是角色圖裡的人。
+   - **色彩與影格正規化**：所有分鏡統一轉為相同解析度、24 fps、`yuv420p` 與 `bt709` 色彩空間；每段精準裁到影格與取樣點（PCM）後才串接，聲畫不再越接越偏（舊版 2 分鐘累積 0.66 秒）。
+   - **自動檢查**：生成前檢查參考圖（三視圖、合照、場景圖有人）；生成後逐分鏡比對台詞與說話時間（faster-whisper）、偵測多出的人臉，列在審核表最上面。
 
 2. **🔊 嚴格單一聲軌（Single Audio Track Policy）**
    - 徹底解決「生成出來有兩個聲軌／雙重人聲疊加」的問題，提供三種互斥音軌模式，並在最終輸出透過 `ffprobe` 強制驗證 `len(audio_streams) == 1`：

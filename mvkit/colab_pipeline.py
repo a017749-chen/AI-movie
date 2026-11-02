@@ -52,23 +52,34 @@ def _has_audio(info: Dict[str, Any]) -> bool:
 
 def normalize_shot_clip(raw_clip: str | Path, output_clip: str | Path, *, project: StoryboardProject,
                         shot: ShotSpec, base_dir: Optional[Path] = None) -> float:
-    """Trim the unstable tail, conform picture (size/fps/bt709) and apply the audio policy. Returns seconds."""
+    """Trim the unstable tail, conform picture (size/fps/bt709) and apply the audio policy. Returns seconds.
+
+    Sample-exact on purpose: the clip gets exactly N video frames and exactly N * (sample_rate / 24) audio
+    samples as PCM. The old version wrote AAC per clip and concatenated those; AAC priming / frame padding
+    made the voice run ~60 ms AHEAD of the lips per clip (0.66 s after a 2-minute batch of 12 clips).
+    The output should be a `.mov` (PCM audio); `assemble_movie` encodes AAC once, after concatenation.
+    """
     raw_clip, output_clip = Path(raw_clip), Path(output_clip)
     output_clip.parent.mkdir(parents=True, exist_ok=True)
     info = probe_media_streams(raw_clip)
     raw_dur = float(info.get("format", {}).get("duration") or shot.duration_sec)
     usable = max(0.5, raw_dur - project.tail_guard_sec)
-    dur = min(shot.duration_sec, usable)
+    frames = max(1, int(round(min(shot.duration_sec, usable) * H3_FPS)))
     W, H, sr = project.width, project.height, project.sample_rate
+    samples = frames * sr // H3_FPS
+    t = f"{frames / H3_FPS:.6f}"
     vf = (f"scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,"
-          f"fps={H3_FPS},format=yuv420p,setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709")
-    t = f"{dur:.3f}"
-    afmt = f"aresample={sr},aformat=sample_fmts=fltp:channel_layouts=stereo"
-    aac = ["-c:a", "aac", "-b:a", "192k", "-ar", str(sr), "-ac", "2"]
+          f"fps={H3_FPS},trim=end_frame={frames},setpts=PTS-STARTPTS,format=yuv420p,"
+          f"setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709")
+    # (no -frames:v: it ends the file while loudnorm still holds ~3 s of audio in its look-ahead buffer)
+    exact = f"aresample={sr},aformat=sample_fmts=s16:channel_layouts=stereo,apad=whole_len={samples}," \
+            f"atrim=end_sample={samples},asetpts=PTS-STARTPTS"
+    pcm = ["-c:a", "pcm_s16le", "-ar", str(sr), "-ac", "2"]
+    video = ["-vf", vf, "-map", "0:v:0", *X264]
     silence = ["-f", "lavfi", "-t", t, "-i", f"anullsrc=channel_layout=stereo:sample_rate={sr}"]
 
     if project.audio_mode == "master_audio":
-        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(raw_clip), "-t", t, "-vf", vf, "-map", "0:v:0", "-an", *X264]
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(raw_clip), *video, "-an"]
     elif project.audio_mode == "clip_voiceover":
         wav = None
         if shot.narration_wav:
@@ -80,25 +91,24 @@ def normalize_shot_clip(raw_clip: str | Path, output_clip: str | Path, *, projec
                 print(f"  warning: {shot.shot_id}: narration file {shot.narration_wav} not found, using silence")
         if wav is not None:
             wav_dur = media_duration(wav)
-            if wav_dur > dur + 0.05:
-                print(f"  warning: {shot.shot_id}: narration {wav_dur:.2f}s is longer than the shot {dur:.2f}s "
-                      f"and will be cut; lengthen the shot")
-            cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(raw_clip), "-i", str(wav), "-t", t, "-vf", vf,
-                   "-af", f"{afmt},apad", "-map", "0:v:0", "-map", "1:a:0", *X264, *aac]
+            if wav_dur > frames / H3_FPS + 0.05:
+                print(f"  warning: {shot.shot_id}: narration {wav_dur:.2f}s is longer than the shot "
+                      f"{frames / H3_FPS:.2f}s and will be cut; lengthen the shot")
+            cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(raw_clip), "-i", str(wav), *video,
+                   "-af", exact, "-map", "1:a:0", *pcm]
         else:
-            cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(raw_clip), *silence, "-t", t, "-vf", vf,
-                   "-map", "0:v:0", "-map", "1:a:0", *X264, *aac]
+            cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(raw_clip), *silence, *video,
+                   "-af", exact, "-map", "1:a:0", *pcm]
     else:  # native_h3_audio
         if _has_audio(info):
-            cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(raw_clip), "-t", t, "-vf", vf,
-                   "-af", f"loudnorm=I=-16:TP=-1.5:LRA=11,{afmt},apad", "-map", "0:v:0", "-map", "0:a:0",
-                   *X264, *aac]
+            cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(raw_clip), *video,
+                   "-af", f"loudnorm=I=-16:TP=-1.5:LRA=11,{exact}", "-map", "0:a:0", *pcm]
         else:
             print(f"  warning: {shot.shot_id}: H3 clip has no audio stream, using silence")
-            cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(raw_clip), *silence, "-t", t, "-vf", vf,
-                   "-map", "0:v:0", "-map", "1:a:0", *X264, *aac]
+            cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(raw_clip), *silence, *video,
+                   "-af", exact, "-map", "1:a:0", *pcm]
     _run(cmd + [str(output_clip)])
-    return media_duration(output_clip)
+    return frames / H3_FPS
 
 
 def build_contact_sheet(clips: Sequence[str | Path], labels: Sequence[str], output_jpg: str | Path,
@@ -151,7 +161,7 @@ def assemble_movie(project: StoryboardProject, raw_clips: Sequence[str | Path], 
     durations: List[float] = []
     norm: List[Path] = []
     for shot, raw in zip(project.shots, raw_clips):
-        p = norm_dir / f"{shot.index:02d}_{shot.shot_id}.mp4"
+        p = norm_dir / f"{shot.index:02d}_{shot.shot_id}.mov"
         durations.append(normalize_shot_clip(raw, p, project=project, shot=shot, base_dir=base_dir))
         norm.append(p)
         print(f"  normalised {shot.shot_id}: {durations[-1]:.2f}s")
@@ -164,7 +174,7 @@ def assemble_movie(project: StoryboardProject, raw_clips: Sequence[str | Path], 
     aac = ["-c:a", "aac", "-b:a", "192k", "-ar", sr, "-ac", "2", "-movflags", "+faststart"]
 
     if project.audio_mode == "master_audio":
-        picture = out / f"{project.title}_picture.mp4"
+        picture = out / f"{project.title}_picture.mov"
         _run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(concat), "-c", "copy",
               str(picture)])
         master = Path(project.master_audio_path) if project.master_audio_path else None
@@ -178,6 +188,8 @@ def assemble_movie(project: StoryboardProject, raw_clips: Sequence[str | Path], 
               "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-af", "apad", *aac, str(clean)])
         picture.unlink(missing_ok=True)
     else:
+        # video frames and PCM samples are both exact per clip, so concatenating them cannot drift;
+        # AAC is encoded once here
         _run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(concat),
               "-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy", *aac, str(clean)])
     clean_check = verify_single_audio_stream(clean)
