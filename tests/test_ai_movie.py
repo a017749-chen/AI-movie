@@ -58,7 +58,11 @@ def test_load_markdown_json_and_mvkit_project(tmp_path: Path):
     assert len(md_proj.shots) == 4
     assert md_proj.width == 1344 and md_proj.height == 768
     p0 = preview_shot(md_proj, md_proj.shots[0], base_dirs=[tmp_path])
-    assert "For the target video, at 0.00 seconds into the target video, <Picture 1>" in p0
+    # the scene picture is a place reference by default (an empty room as frame 0 duplicates people)
+    assert "use it as a reference for the place only" in p0
+    md_proj.scene_as_opening = True
+    assert "For the target video, at 0.00 seconds into the target video, <Picture 1>" in \
+        preview_shot(md_proj, md_proj.shots[0], base_dirs=[tmp_path])
     assert "<Picture 2>" in p0 and "<Picture 3>" in p0
     assert "<d>[Chinese]" in p0
 

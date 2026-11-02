@@ -99,12 +99,12 @@ def test_multi_shot_prompt_timing_framing_and_opening(tmp_path: Path):
     assert "[Shot 2] 3.0-7.0 seconds, medium shot:" in prompt
     assert "[Shot 3] 7.0-10.0 seconds, medium close-up:" in prompt
     assert "The person in <Picture 2> (examinee doctor), voice:" in prompt
-    assert "No one speaks in this shot." in prompt
-    assert "fully referenced" in prompt                                          # opens on a full shot
-    # a segment opening on a close-up uses the scene picture as a place reference only
-    p.shots[1].beats[0].framing = "特寫"
-    prompt2 = preview_shot(p, p.shots[1], base_dirs=[tmp_path])
-    assert "not as the opening frame" in prompt2 and "fully referenced" not in prompt2
+    assert "No one speaks in this shot" in prompt
+    assert "People in this video: exactly two people" in prompt                # head count
+    assert "not as the opening frame" in prompt and "fully referenced" not in prompt
+    # only when the scene picture is a composed keyframe may it be frame 0
+    p.scene_as_opening = True
+    assert "fully referenced" in preview_shot(p, p.shots[0], base_dirs=[tmp_path])
 
 
 def test_picture_budget_follows_character_tiers(tmp_path: Path):
@@ -128,11 +128,15 @@ def test_picture_budget_follows_character_tiers(tmp_path: Path):
     assert set(chars) == {"c5", "c6", "c7", "c8", "c9", "c0", "c1", "c2"}   # npc c3, c4 fall back to words
     prompt = build_h3_prompt(p, shot, plan)
     assert "person 3." in prompt and "person 4." in prompt
-    # fewer characters: the main character's turnaround takes a free slot and points at the main picture
+    # extra views (turnaround sheets) are off by default: they are a common source of cloned people
     shot2 = ShotSpec("02", 2, scene_id="hall", visual_prompt="two people", characters=["c0", "c9"])
+    assert [x.role for x in shot_picture_plan(p, shot2, [tmp_path])] == ["scene", "character", "character"]
+    # opted in: the turnaround takes a free slot and is tied to the main picture as the same person
+    p.send_extra_views = True
     plan2 = shot_picture_plan(p, shot2, [tmp_path])
     assert [x.role for x in plan2] == ["scene", "character", "character", "extra"]
-    assert "<Picture 4> shows another view of person 9 (the same person as <Picture 3>)" in build_h3_prompt(p, shot2, plan2)
+    assert "<Picture 4> is another photo of the same single person as <Picture 3>, not a second person" in \
+        build_h3_prompt(p, shot2, plan2)
 
 
 def test_bible_tiers_and_extra_images_columns():
@@ -195,6 +199,7 @@ def test_runner_mixes_modes_and_chains_only_on_matching_framing(tmp_path: Path):
     refs = tmp_path / "refs"
     refs.mkdir()
     p = _project(refs, real_images=True)
+    p.continuity_mode = "hybrid"                  # chaining is opt-in (presets default to anchor)
     p.shots[1].beats[0].framing = "近景"          # segment 1 ends 近景 -> segment 2 now opens 近景: chains
     runner = H3ColabRunner(comfy_dir=tmp_path / "comfy")
     runner.models = choose_models("reference", "13.0", (8, 0))

@@ -141,6 +141,8 @@ def test_batches_respect_length_and_cover_every_shot(tmp_path: Path):
     assert len(plan_batches(p, 120)) == 1
     # 01(bedside) 02(cart) 03..: with 20 s, the first batch stops at the scene change after 01+02 = 18.5 s
     assert plan_batches(p, 20)[0].shot_ids == ["01", "02"]
+    assert chained_dependents(p, "03") == []                 # preset default: anchor, nothing chains
+    p.continuity_mode = "hybrid"
     assert chained_dependents(p, "03") == ["04", "05"]
 
 
@@ -170,6 +172,7 @@ def test_review_gate_generates_one_batch_at_a_time(tmp_path: Path):
     for n in ("scene_bedside.png", "scene_cart.png", "char_examinee.png", "char_patient.png"):
         Image.new("RGB", (64, 64), (90, 120, 150)).save(refs / n)
     p, _ = _osce_project(refs)
+    p.continuity_mode = "hybrid"            # exercise last-frame chaining (preset default is anchor)
     for s in p.shots:                       # keep the test fast
         s.duration_sec = 5.0
     work = tmp_path / "work"

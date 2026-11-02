@@ -21,7 +21,7 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .script_loader import (
     ShotSpec,
@@ -78,7 +78,7 @@ def shot_fingerprint(project: StoryboardProject, shot: ShotSpec) -> str:
     """Hash of everything that changes the generated clip (text, seed, pictures, project-wide prompt text)."""
     keys = ("style_prefix", "continuity_rules", "negative_rules", "narrator", "overall_soundscape",
             "audio_mode", "inference_mode", "width", "height", "tail_guard_sec", "continuity_mode",
-            "ref_image_size")
+            "ref_image_size", "send_extra_views", "scene_as_opening")
     d = {k: getattr(project, k) for k in keys}
     d["shot"] = {k: v for k, v in asdict(shot).items() if k not in ("index", "title", "subtitle_text", "notes")}
     scene = project.scenes.get(shot.scene_id)
@@ -276,9 +276,26 @@ def estimate_gpu_minutes(project: StoryboardProject, work_dir: str | Path,
             "gpu_minutes": round(rate * secs / 60, 1), "shots": len(todo)}
 
 
+def _beat_people(project: StoryboardProject, b) -> Tuple[str, str]:
+    """('考生、病人', '考生（畫外）') for the checklist / plan tables."""
+    def name(cid: str) -> str:
+        ch = project.characters.get(cid)
+        return ch.name if ch else cid
+    vis = "、".join(name(c) for c in b.on_screen) or "（無人）"
+    if not b.dialogue:
+        who = "—"
+    elif not b.speaker:
+        who = "旁白（畫外）"
+    else:
+        who = name(b.speaker) + ("（畫外）" if b.voice_over else "")
+    return vis, who
+
+
 def write_review_checklist(project: StoryboardProject, batch: Batch, path: str | Path,
-                           preview: Optional[Dict[str, Any]] = None) -> Path:
-    """Markdown checklist for the reviewer (content expert): one row per shot with the scoring points."""
+                           preview: Optional[Dict[str, Any]] = None,
+                           qc: Optional[Dict[str, List[str]]] = None) -> Path:
+    """Markdown checklist for the reviewer (content expert): one row per 分鏡 with who is on screen, who
+    speaks, the line, and the automatic QC findings first so the risky clips are looked at closely."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     names = {cid: ch.name for cid, ch in project.characters.items()}
@@ -286,20 +303,78 @@ def write_review_checklist(project: StoryboardProject, batch: Batch, path: str |
     if preview:
         lines += [f"- 預覽影片：`{preview.get('subtitled_mp4') or preview.get('clean_mp4')}`",
                   f"- 抽幀檢視圖：`{preview.get('review_sheet')}`", ""]
-    lines += ["每支片段請確認：角色長相/服裝一致 · 場景與道具一致 · 動作/技術步驟正確 · 台詞與口型正確 · "
-              "沒有多餘人物、文字或變形的手。", "",
-              "| 鏡號 | 秒數 | 角色 | 台詞 | 評分重點 / 備註 | 結果 |", "| --- | --- | --- | --- | --- | --- |"]
+    flagged = {k: v for k, v in (qc or {}).items() if v}
+    if qc is not None:
+        if flagged:
+            lines += ["## ⚠️ 自動檢查發現（請優先看這些段落）", ""]
+            for sid, issues in flagged.items():
+                lines += [f"- 段落 {sid}：" + "；".join(issues)]
+            lines += [""]
+        else:
+            lines += ["✅ 自動檢查（台詞、說話時間、臉數）沒有發現問題；仍請完整看過預覽。", ""]
+    lines += ["每支片段請確認：角色長相/服裝一致 · 沒有重複或多出的人 · 場景與道具一致 · 動作/技術步驟正確 · "
+              "台詞、說話的人、口型與時間正確 · 沒有文字或變形的手。", "",
+              "| 鏡號 | 秒數 | 入鏡 | 說話者 | 台詞 | 畫面重點 / 備註 | 結果 |",
+              "| --- | --- | --- | --- | --- | --- | --- |"]
     for s in project.shots:
-        if s.shot_id in batch.shot_ids:
-            who = "、".join(names.get(c, c) for c in s.characters) or "—"
-            lines.append(f"| {s.shot_id} | {s.duration_sec:.1f} | {who} | {s.dialogue or '—'} | "
-                         f"{s.notes or '—'} | ☐ 通過 ☐ 重拍 |")
-            for b in s.beats:
-                lines.append(f"| ↳ {b.beat_id} {b.framing} | {b.duration_sec:.1f} | | {b.dialogue or '—'} | "
-                             f"{b.visual[:40]} | |")
-    lines += ["", "全部通過 → 審核步驟選 `approve`；有問題 → 選 `redo_shots` 並填入要重拍的鏡號（逗號分隔）。"]
+        if s.shot_id not in batch.shot_ids:
+            continue
+        mark = " ⚠️" if s.shot_id in flagged else ""
+        who = "、".join(names.get(c, c) for c in s.characters) or "—"
+        lines.append(f"| **{s.shot_id}**{mark} | {s.duration_sec:.1f} | {who} | | {s.dialogue if not s.beats else ''} | "
+                     f"{s.notes or '—'} | ☐ 通過 ☐ 重拍 |")
+        for b in s.beats:
+            vis, spk = _beat_people(project, b)
+            lines.append(f"| ↳ {b.beat_id} {b.framing} | {b.duration_sec:.1f} | {vis} | {spk} | {b.dialogue or '—'} | "
+                         f"{b.visual[:40]} | |")
+    lines += ["", "全部通過 → 審核步驟選 `approve`；有問題 → 選 `redo_shots` 並填入要重拍的鏡號（逗號分隔）。",
+              "人物重複／多出人：先看 Step 3 的參考圖檢查；可在該分鏡加 `出場：考生` 限定入鏡的人再重拍。"]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
+
+
+def format_plan_report(project: StoryboardProject, batch: Batch,
+                       base_dirs: Optional[List[str | Path]] = None) -> str:
+    """What will be sent to H3 for every segment of the batch: pictures in order, and per 分鏡 who is
+    visible and who speaks (畫內 / 畫外). Read it before spending GPU time."""
+    dirs = [Path(b) for b in (base_dirs or []) if b]
+    mode_zh = {"reference": "參考圖", "reference_keyframes": "參考圖+首幀", "first_frame": "首幀",
+               "first_last": "首尾幀"}
+    out: List[str] = []
+    for s in project.shots:
+        if s.shot_id not in batch.shot_ids:
+            continue
+        plan = shot_picture_plan(project, s, dirs)
+        pics = "  ".join(f"<Picture {n}>={Path(pp.path).name}" for n, pp in enumerate(plan, start=1)) or "（無）"
+        out.append(f"■ 段落 {s.shot_id}｜{mode_zh[shot_gen_mode(project, s)]}｜{s.duration_sec:.1f} 秒｜場景 {s.scene_id}")
+        out.append(f"   參考圖：{pics}")
+        for b in s.beats:
+            vis, spk = _beat_people(project, b)
+            line = f"「{b.dialogue}」" if b.dialogue else ""
+            out.append(f"   {b.beat_id:>5} {b.framing or '?':3s} {b.duration_sec:4.1f}s  入鏡：{vis:10s} 說話：{spk} {line}")
+    return "\n".join(out)
+
+
+def write_batch_prompts(project: StoryboardProject, batch: Batch, out_dir: str | Path,
+                        base_dirs: Optional[List[str | Path]] = None) -> List[Path]:
+    """Prompt preview for every segment of the batch (chain / keyframe pictures are added at generation)."""
+    from .script_loader import build_h3_prompt, check_picture_tags
+
+    dirs = [Path(b) for b in (base_dirs or []) if b]
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    paths: List[Path] = []
+    for s in project.shots:
+        if s.shot_id not in batch.shot_ids:
+            continue
+        plan = shot_picture_plan(project, s, dirs)
+        text = build_h3_prompt(project, s, plan)
+        check_picture_tags(text, len(plan))
+        pics = "\n".join(f"# <Picture {n}> = {pp.path}" for n, pp in enumerate(plan, start=1))
+        f = out / f"{s.index:02d}_{s.shot_id}.txt"
+        f.write_text(pics + "\n\n" + text + "\n", encoding="utf-8")
+        paths.append(f)
+    return paths
 
 
 def _slice_audio(src: Path, start: float, seconds: float, dst: Path) -> Path:
@@ -320,8 +395,10 @@ def batch_project(project: StoryboardProject, batch: Batch) -> StoryboardProject
 
 
 def assemble_batch_preview(project: StoryboardProject, batch: Batch, work_dir: str | Path, *,
-                           base_dir: Optional[Path] = None, burn_subtitles: bool = True) -> Dict[str, Any]:
-    """Preview of one batch: the same post-production as the final film, plus the review checklist."""
+                           base_dir: Optional[Path] = None, burn_subtitles: bool = True,
+                           qc: bool = True, asr_model: str = "small") -> Dict[str, Any]:
+    """Preview of one batch: the same post-production as the final film, the automatic QC (lines, speech
+    timing, face count) and the review checklist."""
     from .colab_pipeline import assemble_movie
 
     sub = batch_project(project, batch)
@@ -336,7 +413,14 @@ def assemble_batch_preview(project: StoryboardProject, batch: Batch, work_dir: s
                                                      out / f"master_slice{master.suffix or '.wav'}"))
     clips = [_clip_path(work_dir, s) for s in sub.shots]
     manifest = assemble_movie(sub, clips, out, base_dir=base_dir, burn_subtitles=burn_subtitles)
-    manifest["checklist"] = str(write_review_checklist(project, batch, out / "review_checklist.md", manifest))
+    findings = None
+    if qc:
+        from .qc_review import run_batch_qc
+        findings = run_batch_qc(project, batch.shot_ids, {s.shot_id: c for s, c in zip(sub.shots, clips)},
+                                out / "qc.json", asr_model=asr_model)
+        manifest["qc"] = findings
+    manifest["checklist"] = str(write_review_checklist(project, batch, out / "review_checklist.md", manifest,
+                                                       findings))
     return manifest
 
 
