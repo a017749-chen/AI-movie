@@ -105,14 +105,16 @@ def build_h3_graph(*, models: ModelSet, prompt: str, width: int, height: int, se
                    picture_names: List[str], ref_image_size: str = "max", lora_strength: float = 1.0,
                    sampler: str = "euler", scheduler: str = "beta", crf: int = 18,
                    filename_prefix: str = "ai_movie",
-                   keyframes: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+                   keyframes: Optional[Dict[str, str]] = None,
+                   kept_seconds: Optional[float] = None) -> Dict[str, Any]:
     """ComfyUI API graph for one clip (mirrors the upstream notebook's graph).
 
     keyframes {"first": name, "last": name}: Ref2VA pins them with MiniMaxH3AddGuide at frame 0 / the last
-    frame; FL2VA feeds "last" to the node's last_frame input (the first frame is picture_names[0]).
+    kept frame; FL2VA feeds "last" to the node's last_frame input (the first frame is picture_names[0]).
     """
     keyframes = {k: v for k, v in (keyframes or {}).items() if v}
     frames = h3_frames(seconds)
+    last_idx = min(frames - 1, max(1, round(kept_seconds * 24) - 1)) if kept_seconds is not None else -1
     g: Dict[str, Any] = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": models.diffusion, "weight_dtype": "default"}},
         "2": {"class_type": "LoraLoaderModelOnly",
@@ -133,7 +135,7 @@ def build_h3_graph(*, models: ModelSet, prompt: str, width: int, height: int, se
             inputs[f"ref_images.ref_image_{i}"] = [nid, 0]
         g["7"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": inputs}
         positive = ["7", 0]
-        for nid, img_id, key, idx in (("20", "30", "first", 0), ("21", "31", "last", -1)):
+        for nid, img_id, key, idx in (("20", "30", "first", 0), ("21", "31", "last", last_idx)):
             if key in keyframes:
                 g[img_id] = {"class_type": "LoadImage", "inputs": {"image": keyframes[key]}}
                 g[nid] = {"class_type": "MiniMaxH3AddGuide", "inputs": {
@@ -145,14 +147,14 @@ def build_h3_graph(*, models: ModelSet, prompt: str, width: int, height: int, se
             raise ValueError("FL2VA needs exactly one first-frame picture")
         g["6"] = {"class_type": "LoadImage", "inputs": {"image": picture_names[0]}}
         g["16"] = {"class_type": "ImageScaleToTotalPixels", "inputs": {
-            "image": ["6", 0], "upscale_method": "nearest-exact", "megapixels": 0.98, "resolution_steps": 32}}
+            "image": ["6", 0], "upscale_method": "lanczos", "megapixels": 0.98, "resolution_steps": 32}}
         g["7"] = {"class_type": "MiniMaxH3ImageToVideo", "inputs": {
             "clip": ["3", 0], "vae": ["4", 0], "first_frame": ["16", 0], "prompt": prompt,
             "width": width, "height": height, "length": frames}}
         if "last" in keyframes:
             g["17"] = {"class_type": "LoadImage", "inputs": {"image": keyframes["last"]}}
             g["18"] = {"class_type": "ImageScaleToTotalPixels", "inputs": {
-                "image": ["17", 0], "upscale_method": "nearest-exact", "megapixels": 0.98, "resolution_steps": 32}}
+                "image": ["17", 0], "upscale_method": "lanczos", "megapixels": 0.98, "resolution_steps": 32}}
             g["7"]["inputs"]["last_frame"] = ["18", 0]
         positive = ["7", 0]
     g.update({
@@ -307,12 +309,30 @@ class H3ColabRunner:
         except Exception:
             pass
 
-    def stage_picture(self, src: str | Path, name: str) -> str:
-        from PIL import Image
+    def stage_picture(self, src: str | Path, name: str, *, fit_size: Optional[tuple] = None,
+                      max_short_edge: int = 1280) -> str:
+        """Copy an image into ComfyUI's `input/` folder, fixing EXIF rotation, compositing RGBA alpha onto a
+        clean neutral background (avoiding jagged black alpha fringes), and center-cropping keyframes to exact
+        canvas aspect ratio (`fit_size`) so `MiniMaxH3ImageToVideo` never stretches faces horizontally."""
+        from PIL import Image, ImageOps
         dst = self.comfy_dir / "input" / name
         dst.parent.mkdir(parents=True, exist_ok=True)
-        with Image.open(src) as im:
-            im.convert("RGB").save(dst)
+        with Image.open(src) as raw_im:
+            im = ImageOps.exif_transpose(raw_im)
+            if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                rgba = im.convert("RGBA")
+                bg = Image.new("RGBA", rgba.size, (240, 240, 240, 255))
+                im = Image.alpha_composite(bg, rgba).convert("RGB")
+            else:
+                im = im.convert("RGB")
+            if fit_size is not None:
+                im = ImageOps.fit(im, (int(fit_size[0]), int(fit_size[1])), method=Image.Resampling.LANCZOS)
+            elif max_short_edge and min(im.size) > max_short_edge:
+                scale = max_short_edge / float(min(im.size))
+                nw = max(32, round(im.size[0] * scale))
+                nh = max(32, round(im.size[1] * scale))
+                im = im.resize((nw, nh), Image.Resampling.LANCZOS)
+            im.save(dst)
         return dst.name
 
     def _generate_with_comfy(self, graph: Dict[str, Any], timeout_sec: float = 7200) -> Path:
@@ -464,15 +484,25 @@ class H3ColabRunner:
                 gp = self.plan_generation(project, shot, prev_clip, prev_shot, work, dirs)
                 pictures, chained = gp.pictures, gp.chained
                 prompt = gp.prompt
-                names = [self.stage_picture(p.path, f"aimovie_{shot.index:02d}_{i:02d}.png")
-                         for i, p in enumerate(pictures)]
-                kf_names = {k: self.stage_picture(v, f"aimovie_{shot.index:02d}_kf_{k}.png")
-                            for k, v in gp.keyframes.items()}
+                canvas_fit = (project.width, project.height)
+                names = [
+                    self.stage_picture(
+                        p.path,
+                        f"aimovie_{shot.index:02d}_{i:02d}.png",
+                        fit_size=canvas_fit if gp.engine == "first_frame" else None,
+                    )
+                    for i, p in enumerate(pictures)
+                ]
+                kf_names = {
+                    k: self.stage_picture(v, f"aimovie_{shot.index:02d}_kf_{k}.png", fit_size=canvas_fit)
+                    for k, v in gp.keyframes.items()
+                }
                 seconds = project.generation_seconds(shot)
                 graph = build_h3_graph(models=self._sets()[gp.engine], prompt=prompt, width=project.width,
                                        height=project.height, seconds=seconds, seed=shot.seed,
                                        picture_names=names, ref_image_size=project.ref_image_size,
-                                       filename_prefix=f"aimovie_{shot.index:02d}", keyframes=kf_names)
+                                       filename_prefix=f"aimovie_{shot.index:02d}", keyframes=kf_names,
+                                       kept_seconds=shot.duration_sec)
                 (work / "prompts").mkdir(exist_ok=True)
                 (work / "prompts" / f"{shot.index:02d}_{shot.shot_id}.txt").write_text(prompt, encoding="utf-8")
                 print(f"[{shot.index}/{len(project.shots)}] {shot.shot_id}: {seconds:.2f}s, {gp.mode}, "

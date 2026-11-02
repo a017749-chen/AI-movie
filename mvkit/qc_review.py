@@ -18,6 +18,7 @@ Both are hints for the reviewer, never a reason to skip watching the preview. Mi
 from __future__ import annotations
 
 import json
+import math
 import re
 import subprocess
 from difflib import SequenceMatcher
@@ -25,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .script_loader import (
+    FACE_WORDS,
     ShotSpec,
     StoryboardProject,
     _resolve_path,
@@ -46,8 +48,23 @@ def _faces_detector():
     return None if det.empty() else det
 
 
-def count_faces(image, detector=None) -> Optional[int]:
-    """Frontal faces in a PIL image or numpy RGB array (None when OpenCV is not installed)."""
+def _profile_detector():
+    try:
+        import cv2
+        path = Path(cv2.data.haarcascades) / "haarcascade_profileface.xml"
+        det = cv2.CascadeClassifier(str(path))
+    except Exception:
+        return None
+    return None if det.empty() else det
+
+
+def count_faces(image, detector=None, *, portrait: bool = False) -> Optional[int]:
+    """Frontal faces in a PIL image or numpy RGB array (None when OpenCV is not installed).
+
+    When `portrait=True` (checking a single-character reference portrait), uses a larger relative minSize to
+    suppress tiny coat-button/badge false positives, and falls back to `haarcascade_profileface.xml` when the
+    character is drawn at a slight 3/4 angle.
+    """
     detector = detector or _faces_detector()
     if detector is None:
         return None
@@ -56,9 +73,24 @@ def count_faces(image, detector=None) -> Optional[int]:
     arr = np.asarray(image.convert("RGB") if hasattr(image, "convert") else image)
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     short = min(gray.shape[:2])
-    size = max(24, int(short * 0.06))
+    ratio = 0.09 if portrait else 0.06
+    size = max(24, int(short * ratio))
     faces = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6, minSize=(size, size))
-    return int(len(faces))
+    boxes = list(faces) if len(faces) else []
+    if portrait and len(boxes) > 1:
+        max_w = max(int(b[2]) for b in boxes)
+        boxes = [b for b in boxes if int(b[2]) >= max_w * 0.45]
+    if portrait and not boxes:
+        prof = _profile_detector()
+        if prof is not None:
+            p1 = prof.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6, minSize=(size, size))
+            if len(p1):
+                boxes = [p1[0]]
+            else:
+                p2 = prof.detectMultiScale(cv2.flip(gray, 1), scaleFactor=1.1, minNeighbors=6, minSize=(size, size))
+                if len(p2):
+                    boxes = [p2[0]]
+    return int(len(boxes))
 
 
 _converter = None
@@ -121,10 +153,13 @@ def check_reference_images(project: StoryboardProject, base_dirs: Optional[Seque
         try:
             with Image.open(path) as im:
                 w, h = im.size
-                faces = count_faces(im, det) if det is not None else None
+                has_alpha = im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info)
+                faces = count_faces(im, det, portrait=portrait) if det is not None else None
         except Exception as e:                       # unreadable picture
             warnings.append(f"{what}：{path.name} 打不開（{e}）")
             return
+        if has_alpha and portrait:
+            warnings.append(f"{what}：{path.name} 帶有透明背景（執行時會自動補乾淨素色灰白底，避免髮絲黑邊破圖）")
         if min(w, h) < 512:
             warnings.append(f"{what}：{path.name} 只有 {w}×{h}，太小，臉容易跑掉（建議短邊 ≥ 768）")
         if portrait and w > h * 1.25:
@@ -148,6 +183,26 @@ def check_reference_images(project: StoryboardProject, base_dirs: Optional[Seque
                 look(raw, f"角色 {cid} 其他參考圖", want_faces=None, portrait=True)
     for sid, sc in project.scenes.items():
         look(sc.image_path, f"場景 {sid}", want_faces=0, portrait=False)
+    canvas_ratio = project.width / max(1, project.height)
+    for shot in project.shots:
+        for raw, label in ((shot.first_frame, f"段落 {shot.shot_id} 首幀圖"),
+                           (shot.last_frame, f"段落 {shot.shot_id} 尾幀圖")):
+            if not raw:
+                continue
+            kp = Path(_resolve_path(raw, dirs))
+            if not kp.is_file():
+                continue
+            try:
+                with Image.open(kp) as kim:
+                    kw, kh = kim.size
+            except Exception as e:
+                warnings.append(f"{label}：{kp.name} 打不開（{e}）")
+                continue
+            if min(kw, kh) < 512:
+                warnings.append(f"{label}：{kp.name} 只有 {kw}×{kh}，解析度太低容易破圖（建議短邊 ≥ 768）")
+            if abs(math.log((kw / max(1, kh)) / canvas_ratio)) > 0.28:
+                warnings.append(f"{label}：{kp.name} 長寬比（{kw}×{kh}）與影片畫布（{project.width}×{project.height}）"
+                                f"差距較大，生成時會自動置中裁切以避免人物被拉扁變形；建議直接用同比例關鍵幀圖")
     if det is None:
         warnings.append("（沒有可用的 OpenCV 人臉偵測，略過「圖裡有幾張臉」的檢查）")
     return warnings
@@ -220,19 +275,77 @@ def _frame_at(clip: Path, t: float):
 
 def face_issues(project: StoryboardProject, shot: ShotSpec, clip: str | Path, detector=None) -> List[str]:
     detector = detector or _faces_detector()
-    if detector is None or not shot.beats:
+    if detector is None:
         return []
     issues: List[str] = []
-    for b, (t0, t1) in zip(shot.beats, _beat_windows(shot)):
-        if is_detail_beat(b):
-            continue
-        img = _frame_at(Path(clip), (t0 + t1) / 2)
+    if shot.beats:
+        for b, (t0, t1) in zip(shot.beats, _beat_windows(shot)):
+            if is_detail_beat(b):
+                continue
+            img = _frame_at(Path(clip), (t0 + t1) / 2)
+            if img is None:
+                continue
+            n = count_faces(img, detector) or 0
+            want = len(b.on_screen)
+            if n > want:
+                issues.append(f"分鏡 {b.beat_id}: 偵測到 {n} 張臉，腳本只有 {want} 人入鏡（可能重複人物或多出路人，請確認）")
+        return issues
+    vis_text = " ".join((shot.title, shot.visual_prompt, shot.camera_motion)).lower()
+    if any(w in vis_text for w in ("大特寫", "特寫", "extreme close", "close-up", "insert")) \
+            and not any(w in (shot.visual_prompt or "").lower() for w in FACE_WORDS):
+        return []
+    if project.characters:
+        img = _frame_at(Path(clip), max(0.2, shot.duration_sec / 2.0))
+        if img is not None:
+            n = count_faces(img, detector) or 0
+            want = len(shot.characters)
+            if n > want:
+                issues.append(f"段落 {shot.shot_id}: 偵測到 {n} 張臉，腳本只有 {want} 人入鏡（可能重複人物或多出路人，請確認）")
+    return issues
+
+
+def visual_artifact_issues(project: StoryboardProject, shot: ShotSpec, clip: str | Path) -> List[str]:
+    """Detect broken/corrupted frames, blackouts, flash spikes or severe mid-clip blur ('破圖') in a clip."""
+    import numpy as np
+    clip_p = Path(clip)
+    if not clip_p.is_file():
+        return [f"段落 {shot.shot_id}: 找不到生成片段 {clip_p.name}"]
+    sample_times: List[Tuple[str, float]] = [("開頭", 0.08)]
+    if shot.beats:
+        for b, (t0, t1) in zip(shot.beats, _beat_windows(shot)):
+            sample_times.append((f"分鏡 {b.beat_id}", (t0 + t1) / 2.0))
+    else:
+        sample_times.append((f"段落 {shot.shot_id} 中段", max(0.25, shot.duration_sec / 2.0)))
+    sample_times.append(("結尾", max(0.15, shot.duration_sec - 0.12)))
+
+    issues: List[str] = []
+    lumas: List[Tuple[str, float]] = []
+    sharpnesses: List[Tuple[str, float]] = []
+    for label, ts in sample_times:
+        img = _frame_at(clip_p, ts)
         if img is None:
+            issues.append(f"{label}（{ts:.1f}s）無法解碼畫面（疑似檔案損毀或破圖）")
             continue
-        n = count_faces(img, detector) or 0
-        want = len(b.on_screen)
-        if n > want:
-            issues.append(f"分鏡 {b.beat_id}: 偵測到 {n} 張臉，腳本只有 {want} 人入鏡（可能重複人物或多出路人，請確認）")
+        arr = np.asarray(img.convert("RGB"), dtype=np.float32)
+        gray = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+        mean_luma = float(gray.mean())
+        std_luma = float(gray.std())
+        gx = np.diff(gray, axis=1)
+        gy = np.diff(gray, axis=0)
+        sharp = float(np.sqrt((gx[:-1, :] ** 2 + gy[:, :-1] ** 2)).mean()) if gray.shape[0] > 2 and gray.shape[1] > 2 else 0.0
+        lumas.append((label, mean_luma))
+        sharpnesses.append((label, sharp))
+        if mean_luma < 5.0 and std_luma < 4.0:
+            issues.append(f"{label}（{ts:.1f}s）出現全黑畫面（疑似閃黑或破圖）")
+        elif mean_luma > 250.0 and std_luma < 4.0:
+            issues.append(f"{label}（{ts:.1f}s）出現過曝全白畫面（疑似閃白或破圖）")
+    if len(sharpnesses) >= 3:
+        vals = sorted(s for _, s in sharpnesses)
+        median_sharp = vals[len(vals) // 2]
+        if median_sharp > 8.0:
+            for label, s in sharpnesses:
+                if s < median_sharp * 0.25:
+                    issues.append(f"{label} 清晰度驟降（疑似轉場融化或破圖，建議確認預覽）")
     return issues
 
 
@@ -248,7 +361,7 @@ def load_asr_model(model_size: str = "small"):
 
 def run_batch_qc(project: StoryboardProject, shot_ids: Sequence[str], clips: Dict[str, Path],
                  out_json: Optional[str | Path] = None, *, speech: bool = True, faces: bool = True,
-                 asr_model: str = "small") -> Dict[str, List[str]]:
+                 artifacts: bool = True, asr_model: str = "small") -> Dict[str, List[str]]:
     """{shot_id: [issues]} for the clips of one batch (raw H3 clips, before the tail is trimmed)."""
     model = load_asr_model(asr_model) if speech and project.audio_mode == "native_h3_audio" else None
     det = _faces_detector() if faces else None
@@ -266,6 +379,11 @@ def run_batch_qc(project: StoryboardProject, shot_ids: Sequence[str], clips: Dic
                 issues.append(f"段落 {shot.shot_id}: 台詞檢查失敗（{e}）")
         if det is not None:
             issues += face_issues(project, shot, clip, det)
+        if artifacts:
+            try:
+                issues += visual_artifact_issues(project, shot, clip)
+            except Exception:
+                pass
         result[shot.shot_id] = issues
     if out_json:
         Path(out_json).write_text(json.dumps(result, indent=1, ensure_ascii=False), encoding="utf-8")

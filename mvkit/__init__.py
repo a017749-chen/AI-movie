@@ -64,7 +64,15 @@ from .colab_pipeline import (
     verify_single_audio_stream,
 )
 from .script_import import import_script, import_script_text, parse_freeform_script, read_script_text
-from .alignment import Bible, align_project, apply_bible, format_alignment_report, load_bible
+from .alignment import (
+    Bible,
+    align_project,
+    apply_bible,
+    discover_bible_from_refs,
+    format_alignment_report,
+    load_bible,
+    supplement_bible_from_refs,
+)
 from .presets import PRESETS, apply_preset
 from .segment_script import SEGMENT_RULES, check_segments, is_segment_script, parse_segment_script
 from .batches import (
@@ -134,8 +142,10 @@ __all__ = [
     "Bible",
     "align_project",
     "apply_bible",
+    "discover_bible_from_refs",
     "format_alignment_report",
     "load_bible",
+    "supplement_bible_from_refs",
     "PRESETS",
     "apply_preset",
     "SEGMENT_RULES",

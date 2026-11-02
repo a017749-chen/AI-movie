@@ -274,7 +274,11 @@ def check_segments(project: StoryboardProject, rule: str = "10s_3") -> List[str]
                 issues.append(f"段落 {s.shot_id}: {s.duration_sec:.1f} 秒，規格是 {target:g} 秒一段")
             if len(s.beats) < min_beats:
                 issues.append(f"段落 {s.shot_id}: 只有 {len(s.beats)} 個分鏡，規格至少 {min_beats} 個")
+        if len(s.beats) > 7:
+            issues.append(f"段落 {s.shot_id}: 單段切了 {len(s.beats)} 個分鏡（建議 ≤ 6 個），切鏡過密容易融化破圖")
         for b in s.beats:
+            if b.duration_sec < 1.8:
+                issues.append(f"分鏡 {b.beat_id}: 只有 {b.duration_sec:.1f} 秒（建議 ≥ 2.0 秒），分鏡太短容易轉場破圖")
             if b.missing_fields:
                 issues.append(f"分鏡 {b.beat_id}: 缺 {'、'.join(b.missing_fields)}")
             chars = len(re.sub(r"[\s，。、；：！？,.!?「」（）()]", "", b.dialogue))

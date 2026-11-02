@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .script_loader import (
+    FACE_WORDS,
+    IMAGE_EXTS,
     MAX_REFERENCE_IMAGES,
     CharacterSpec,
     SceneAnchorSpec,
@@ -167,6 +169,111 @@ def apply_bible(project: StoryboardProject, bible: Bible) -> StoryboardProject:
     for sid, sc in bible.scenes.items():
         project.scenes[sid] = sc
     return project
+
+
+_SCENE_PREFIX_RE = re.compile(r"^(?:scene|場景|地點|背景|bg)[_\-\s]+(.+)$", re.I)
+_CHAR_PREFIX_RE = re.compile(r"^(?:char|character|人物|角色)[_\-\s]+(.+)$", re.I)
+_KEYFRAME_PREFIX_RE = re.compile(r"^(?:kf|keyframe|first|last|首幀|尾幀)[_\-\s]", re.I)
+_EXTRA_VIEW_SUFFIX_RE = re.compile(r"[_\-\s](?:turnaround|face|side|back|extra|三視圖|特寫|側面|背面)$", re.I)
+
+
+def discover_bible_from_refs(refs_dir: str | Path) -> Bible:
+    """Build a Character & Scene Bible automatically from user-uploaded images in `refs_dir`.
+
+    Naming conventions recognised out of the box:
+      * Scene images:     `scene_<name>.png`, `場景_<name>.jpg`, `地點_<name>.webp`, `bg_<name>.png`
+      * Character images: `char_<name>.png`, `人物_<name>.jpg`, `角色_<name>.webp`
+    Keyframe files (`kf_*`, `首幀_*`, `尾幀_*`) and turnaround extras (`*_turnaround`, `*_三視圖`) are skipped
+    so they never become duplicate characters.
+    """
+    bible = Bible()
+    rdir = Path(refs_dir)
+    if not rdir.is_dir():
+        return bible
+    files = sorted(p for p in rdir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+    for p in files:
+        stem = re.sub(r"\s*\(\d+\)$", "", p.stem).strip()
+        if _KEYFRAME_PREFIX_RE.match(stem) or _EXTRA_VIEW_SUFFIX_RE.search(stem):
+            continue
+        m_sc = _SCENE_PREFIX_RE.match(stem)
+        if m_sc:
+            raw_id = m_sc.group(1).strip()
+            if raw_id and raw_id not in bible.scenes:
+                bible.scenes[raw_id] = SceneAnchorSpec(
+                    id=raw_id, description="", image_path=p.name, name=raw_id, aliases=[raw_id]
+                )
+            continue
+        m_ch = _CHAR_PREFIX_RE.match(stem)
+        if m_ch:
+            raw_id = m_ch.group(1).strip()
+            if raw_id and raw_id not in bible.characters:
+                bible.characters[raw_id] = CharacterSpec(
+                    id=raw_id, name=raw_id, image_path=p.name, aliases=[raw_id],
+                    lead=(len(bible.characters) == 0), tier="main" if len(bible.characters) == 0 else "secondary",
+                )
+    return bible
+
+
+def supplement_bible_from_refs(project: StoryboardProject, refs_dir: str | Path) -> List[str]:
+    """Auto-bind uploaded character/scene images in `refs_dir` when `image_path` is blank or missing,
+    and register any additional `char_*` / `人物_*` / `scene_*` / `場景_*` images not yet in the project."""
+    notes: List[str] = []
+    rdir = Path(refs_dir)
+    if not rdir.is_dir():
+        return notes
+    files = sorted(p for p in rdir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+    by_stem = {re.sub(r"\s*\(\d+\)$", "", p.stem).strip().lower(): p for p in files}
+
+    for cid, ch in project.characters.items():
+        resolved = _resolve_path(ch.image_path, [rdir]) if ch.image_path else ""
+        if resolved and Path(resolved).is_file():
+            continue
+        candidates = [cid, ch.name] + list(ch.aliases or [])
+        for cand in candidates:
+            key = cand.strip().lower()
+            for probe in (f"char_{key}", f"人物_{key}", f"角色_{key}", key):
+                if probe in by_stem:
+                    ch.image_path = by_stem[probe].name
+                    notes.append(f"自動綁定角色「{ch.name}」參考圖 → {by_stem[probe].name}")
+                    break
+            if ch.image_path and Path(_resolve_path(ch.image_path, [rdir])).is_file():
+                break
+
+    for sid, sc in project.scenes.items():
+        if sid == "default":
+            continue
+        resolved = _resolve_path(sc.image_path, [rdir]) if sc.image_path else ""
+        if resolved and Path(resolved).is_file():
+            continue
+        candidates = [sid, sc.name] + list(sc.aliases or [])
+        for cand in candidates:
+            key = cand.strip().lower()
+            for probe in (f"scene_{key}", f"場景_{key}", f"地點_{key}", f"bg_{key}", key):
+                if probe in by_stem:
+                    sc.image_path = by_stem[probe].name
+                    notes.append(f"自動綁定場景「{sc.name or sid}」參考圖 → {by_stem[probe].name}")
+                    break
+            if sc.image_path and Path(_resolve_path(sc.image_path, [rdir])).is_file():
+                break
+
+    discovered = discover_bible_from_refs(rdir)
+    existing_char_imgs = {Path(c.image_path).stem.lower() for c in project.characters.values() if c.image_path}
+    for cid, ch in discovered.characters.items():
+        if cid not in project.characters and not find_character(project, cid) \
+                and Path(ch.image_path).stem.lower() not in existing_char_imgs:
+            if any(c.lead for c in project.characters.values()):
+                ch.lead = False
+                ch.tier = "secondary"
+            project.characters[cid] = ch
+            notes.append(f"從上傳圖片自動加入角色「{cid}」（{ch.image_path}）")
+
+    existing_scene_imgs = {Path(s.image_path).stem.lower() for s in project.scenes.values() if s.image_path}
+    for sid, sc in discovered.scenes.items():
+        if sid not in project.scenes and not find_scene(project, sid) \
+                and Path(sc.image_path).stem.lower() not in existing_scene_imgs:
+            project.scenes[sid] = sc
+            notes.append(f"從上傳圖片自動加入場景「{sid}」（{sc.image_path}）")
+    return notes
 
 
 # ---------------------------------------------------------------------- alignment
@@ -350,6 +457,10 @@ def align_project(project: StoryboardProject, base_dirs: Optional[List[str | Pat
 
     for shot in project.shots:
         warn: List[str] = []
+        raw_char_tokens = [c.strip() for c in shot.characters if c and c.strip()]
+        explicit_empty_cast = bool(raw_char_tokens) and all(
+            re.fullmatch(r"(無|none|沒有人|無人|—|-)", c, flags=re.I) for c in raw_char_tokens
+        )
         listed = _resolve_names(project, shot.characters, warn)
 
         # where: bible scene by name/alias; a framing-only line ("特寫上臂") stays in a room that holds
@@ -387,17 +498,25 @@ def align_project(project: StoryboardProject, base_dirs: Optional[List[str | Pat
                 chars += b.on_screen
         else:
             # one-cut shots: listed + named people, the speaker and who they talk to; the scene's cast
-            # only when the shot names nobody at all
-            chars = listed + _mentioned(project, " ".join((shot.title, shot.visual_prompt, shot.dialogue)))
+            # only when the shot names nobody at all AND is not an explicit empty/detail shot
+            vis_text = " ".join((shot.title, shot.visual_prompt, shot.camera_motion))
+            detail_one_cut = any(w in vis_text.lower() for w in ("大特寫", "特寫", "extreme close", "close-up", "insert")) \
+                and not any(w in (shot.visual_prompt or "").lower() for w in FACE_WORDS)
+            empty_scene_words = any(w in (shot.visual_prompt or "") for w in ("空景", "無人", "沒有人", "空無一人"))
+            off = False
+            chars = [] if explicit_empty_cast else (
+                listed + _mentioned(project, " ".join((shot.title, shot.visual_prompt, shot.dialogue)))
+            )
             if shot.speaker and shot.speaker not in project.characters:
                 spk, addressee, off = _resolve_cue(project, shot.speaker, warn)
                 shot.speaker = spk
-                if addressee:
+                if addressee and not explicit_empty_cast:
                     chars.append(addressee)
-            if shot.speaker in project.characters:
+            if shot.speaker in project.characters and not off and not explicit_empty_cast:
                 chars.append(shot.speaker)
-            if not chars:
+            if not chars and not explicit_empty_cast and not empty_scene_words and not detail_one_cut:
                 chars = scene_cast
+            shot.voice_over = bool(shot.speaker) and (off or detail_one_cut or shot.speaker not in chars)
 
         shot.characters = sorted(dict.fromkeys(chars), key=lambda c: order.get(c, 99))
         if len(shot.characters) > MAX_REFERENCE_IMAGES - 1:

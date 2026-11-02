@@ -21,9 +21,10 @@ PRESETS: Dict[str, Dict[str, str]] = {
             "and the room layout, their screen positions and the lighting exactly consistent with the reference "
             "pictures. Medical devices keep the same shape and colour in every shot."),
         "negative_rules": (
-            "No flicker, no face changes, no extra people, anatomically correct hands with five fingers, no "
-            "unsafe or incorrect clinical technique, no blood unless described, no captions, no logos, no "
-            "generated text, labels or watermarks."),
+            "No flicker, no face changes, no extra people, no background bystanders or passersby, "
+            "anatomically correct hands with five fingers, no extra limbs, no split screen, "
+            "no morphing or corrupted frames, no unsafe or incorrect clinical technique, no blood unless "
+            "described, no captions, no logos, no generated text, labels or watermarks."),
         "narrator": "A calm, clear off-screen instructor (S1) speaks in standard Taiwan Mandarin at a measured pace",
         "overall_soundscape": "Quiet clinical skills room tone, soft rustle of gloves and equipment.",
         "continuity_mode": "anchor",        # see docs/zh-TW/ARCHITECTURE_REVIEW.md
@@ -38,8 +39,9 @@ PRESETS: Dict[str, Dict[str, str]] = {
             "Keep every person's face, hairstyle, clothing and props, the room layout, screen positions and "
             "lighting exactly consistent with the reference pictures."),
         "negative_rules": (
-            "No flicker, no face changes, no extra people, anatomically correct hands, no captions, no logos, "
-            "no generated text or watermarks."),
+            "No flicker, no face changes, no extra people, no background bystanders or passersby, "
+            "anatomically correct hands with five fingers, no extra limbs, no split screen, "
+            "no morphing or corrupted frames, no captions, no logos, no generated text or watermarks."),
         "narrator": "A warm, clear off-screen teacher (S1) speaks in standard Taiwan Mandarin at a measured pace",
         "overall_soundscape": "Quiet indoor room tone with soft natural movement sounds.",
         "continuity_mode": "anchor",        # see docs/zh-TW/ARCHITECTURE_REVIEW.md
@@ -55,8 +57,9 @@ PRESETS: Dict[str, Dict[str, str]] = {
             "Keep every person's face, hairstyle, clothing and props, the location, screen positions and the "
             "colour grade exactly consistent with the reference pictures."),
         "negative_rules": (
-            "No flicker, no face changes, no extra people, anatomically correct hands, no captions, no logos, "
-            "no generated text or watermarks."),
+            "No flicker, no face changes, no extra people, no background bystanders or passersby, "
+            "anatomically correct hands with five fingers, no extra limbs, no split screen, "
+            "no morphing or corrupted frames, no captions, no logos, no generated text or watermarks."),
         "narrator": "An upbeat, sincere off-screen narrator (S1) speaks in standard Taiwan Mandarin",
         "overall_soundscape": "Light ambient hospital atmosphere, gentle footsteps.",
         "continuity_mode": "anchor",

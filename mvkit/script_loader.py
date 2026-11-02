@@ -132,6 +132,7 @@ class ShotSpec:
     gen_mode: str = ""                # "" = project.inference_mode; see GEN_MODE_ENGINE
     first_frame: str = ""             # keyframe picture pinned at frame 0 (融圖 key frame)
     last_frame: str = ""              # keyframe picture pinned at the last frame
+    voice_over: bool = False          # one-cut shot: speaker is off-screen / hands detail shot (no lips move)
 
     @property
     def start_framing(self) -> str:
@@ -176,12 +177,13 @@ class StoryboardProject:
         "restrained camera motion."
     )
     continuity_rules: str = (
-        "Keep every person's face, hairstyle, clothing and props, the room layout, screen positions and "
-        "lighting exactly consistent with the reference pictures."
+        "Keep every person's face, hairstyle, clothing and props, the room layout, background details, "
+        "screen positions and lighting strictly consistent with the reference pictures."
     )
     negative_rules: str = (
-        "No flicker, no face changes, no extra people, anatomically correct hands, "
-        "no captions, no logos, no generated text or watermarks."
+        "No flicker, no face changes, no extra people, no background bystanders or passersby, "
+        "anatomically correct hands with five fingers, no extra limbs, no split screen, "
+        "no morphing or corrupted frames, no captions, no logos, no generated text or watermarks."
     )
     narrator: str = "A calm female off-screen narrator (S1) speaks in clear Taiwan Mandarin at a measured pace"
     overall_soundscape: str = "Quiet indoor room tone with soft natural movement sounds."
@@ -198,7 +200,13 @@ class StoryboardProject:
         self.width, self.height = ASPECT_PRESETS[aspect]
 
     def generation_seconds(self, shot: ShotSpec) -> float:
-        """Requested H3 length: the kept length plus the tail that gets trimmed, never below 5 s."""
+        """Requested H3 length: the kept length plus the tail that gets trimmed, never below 5 s.
+
+        In `first_last` mode (`last_frame` pinned at the final latent frame), the tail is anchored to a clean
+        keyframe rather than free-running, so we do not pad `tail_guard_sec` past `last_frame`.
+        """
+        if shot_gen_mode(self, shot) == "first_last" and shot.last_frame:
+            return min(H3_MAX_SECONDS, max(H3_STABLE_MIN_SECONDS, float(shot.duration_sec)))
         return min(H3_MAX_SECONDS, max(H3_STABLE_MIN_SECONDS, shot.duration_sec + self.tail_guard_sec))
 
     def validate(self) -> None:
@@ -266,14 +274,42 @@ _clean_dialogue_tags = clean_dialogue
 
 
 def _resolve_path(p: str, base_dirs: List[Path]) -> str:
+    """Find `p` in `base_dirs`, tolerating case differences and AI-image extension swaps (.png/.jpg/.webp)."""
     if not p:
         return ""
-    cand = Path(p)
+    cand = Path(p.strip())
     if cand.is_absolute():
         return str(cand)
     for b in base_dirs:
         if b and (b / cand).exists():
             return str((b / cand).resolve())
+    want_name = cand.name.lower()
+    want_stem = re.sub(r"\s*\(\d+\)$", "", cand.stem).lower()
+    is_img_query = cand.suffix.lower() in IMAGE_EXTS or not cand.suffix
+    ext_rank = {ext: i for i, ext in enumerate(IMAGE_EXTS)}
+    for b in base_dirs:
+        if not b:
+            continue
+        folder = (b / cand.parent) if str(cand.parent) not in ("", ".") else b
+        if not folder.is_dir():
+            continue
+        exact_ci: Optional[Path] = None
+        stem_matches: List[Path] = []
+        for item in folder.iterdir():
+            if not item.is_file():
+                continue
+            if item.name.lower() == want_name:
+                exact_ci = item
+                break
+            if is_img_query and item.suffix.lower() in IMAGE_EXTS:
+                item_stem = re.sub(r"\s*\(\d+\)$", "", item.stem).lower()
+                if item_stem == want_stem:
+                    stem_matches.append(item)
+        if exact_ci is not None:
+            return str(exact_ci.resolve())
+        if stem_matches:
+            stem_matches.sort(key=lambda x: (ext_rank.get(x.suffix.lower(), 99), len(x.name), x.name))
+            return str(stem_matches[0].resolve())
     return p
 
 
@@ -321,16 +357,28 @@ def shot_picture_plan(project: StoryboardProject, shot: ShotSpec,
         return bool(p) and Path(p).is_file()
 
     if shot.reference_images:
-        char_by_file = {Path(c.image_path).name: c for c in project.characters.values() if c.image_path}
+        char_by_file: Dict[str, CharacterSpec] = {}
+        for c in project.characters.values():
+            if c.image_path:
+                char_by_file[Path(c.image_path).name.lower()] = c
+                char_by_file[Path(c.image_path).stem.lower()] = c
+        unassigned_chars = [c for c in shot.characters if c not in project.characters]
         for raw in shot.reference_images:
             p = _resolve_path(raw, base_dirs)
             if not exists(p):
                 continue
-            ch = char_by_file.get(Path(p).name)
+            pp = Path(p)
+            ch = char_by_file.get(pp.name.lower()) or char_by_file.get(pp.stem.lower())
             if ch:
                 plan.append(PictureRef(p, "character", _character_label(ch), ch.id))
-            elif not plan:
+            elif not plan and not re.match(r"^(char_|人物_|角色_)", pp.stem, flags=re.I):
                 plan.append(PictureRef(p, "scene", "the scene, people and composition"))
+            elif unassigned_chars:
+                cname = unassigned_chars.pop(0)
+                plan.append(PictureRef(p, "character", cname, cname))
+            elif re.match(r"^(char_|人物_|角色_)", pp.stem, flags=re.I):
+                cname = re.sub(r"^(char_|人物_|角色_)", "", pp.stem, flags=re.I) or pp.stem
+                plan.append(PictureRef(p, "character", cname, cname))
             else:
                 plan.append(PictureRef(p, "extra", "an additional visual reference"))
     else:
@@ -458,10 +506,24 @@ def _voices_line(project: StoryboardProject, speakers: List[str]) -> str:
 
 def _people_line(project: StoryboardProject, shot: ShotSpec, pictures: List[PictureRef]) -> str:
     """Head count for the whole clip: the most effective guard against duplicated / extra people."""
-    cast = [c for c in shot.characters if c in project.characters]
+    _empty_words = {"無", "none", "沒有人", "無人", "-", "—"}
+    cast = [c for c in shot.characters if c and c.strip().lower() not in _empty_words
+            and (not project.characters or c in project.characters)]
+    if not cast and not project.characters:
+        cast = [p.char_id for p in pictures if p.role == "character" and p.char_id]
     if not cast:
-        return "No people appear in this video unless a shot below names them; no faces, no bystanders."
-    who = [_who(project, c, pictures) for c in cast]
+        if shot.beats or project.characters or any(c.strip().lower() in _empty_words for c in shot.characters):
+            return "No people appear in this video unless a shot below names them; no faces, no bystanders."
+        return ("Only the people explicitly described appear in this video: no twins, no clones, "
+                "no mirrored copies, no extra people or background bystanders.")
+
+    def _desc_person(cid: str) -> str:
+        if cid in project.characters:
+            return _who(project, cid, pictures)
+        n = _picture_of(pictures, cid, cid)
+        return f"the person in <Picture {n}> ({cid})" if n else cid
+
+    who = [_desc_person(c) for c in cast]
     n = len(cast)
     lst = who[0] if n == 1 else ", ".join(who[:-1]) + " and " + who[-1]
     count = {1: "one person", 2: "two people", 3: "three people", 4: "four people"}.get(n, f"{n} people")
@@ -472,7 +534,22 @@ def _people_line(project: StoryboardProject, shot: ShotSpec, pictures: List[Pict
 
 
 def _on_screen_line(project: StoryboardProject, beat: BeatSpec, pictures: List[PictureRef]) -> str:
+    _empty_words = {"無", "none", "沒有人", "無人", "-", "—"}
     vis = [c for c in beat.on_screen if c in project.characters]
+    if not vis and not project.characters:
+        raw_cast = [c for c in beat.cast if c and c.strip().lower() not in _empty_words]
+        if raw_cast:
+            who_raw = " and ".join(
+                f"the person in <Picture {_picture_of(pictures, c, c)}> ({c})" if _picture_of(pictures, c, c) else c
+                for c in raw_cast
+            )
+            if is_detail_beat(beat):
+                return f"On screen: only the hands and forearms of {who_raw}; no face is visible."
+            return f"On screen: {who_raw}; nobody else."
+        if not any(c.strip().lower() in _empty_words for c in beat.cast):
+            if is_detail_beat(beat):
+                return "On screen: close-up detail; no face is visible."
+            return "On screen: only the people described in this shot; no bystanders."
     if not vis:
         return "On screen: no people, no faces."
     who = " and ".join(_who(project, c, pictures) for c in vis)
@@ -586,14 +663,14 @@ def build_h3_prompt(project: StoryboardProject, shot: ShotSpec, pictures: List[P
         elif speakers:
             action.append("Hold the final pose silently for the last second.")
     else:
-        if shot.characters:
-            body.append(_people_line(project, shot, pictures))
+        body.append(_people_line(project, shot, pictures))
         action.append(shot.visual_prompt.strip().rstrip("。.") + ".")
         if shot.camera_motion:
             action.append(f"Camera: {shot.camera_motion.strip().rstrip('。.')}.")
         spoken = clean_dialogue(shot.dialogue)
         if native and spoken:
-            action.append(_speech(project, shot.speaker, spoken, 0.4, max(1.5, seconds - 1.0), pictures))
+            action.append(_speech(project, shot.speaker, spoken, 0.4, max(1.5, seconds - 1.0), pictures,
+                                  voice_over=shot.voice_over))
             action.append("Hold the final pose silently for the last second.")
             speakers.append(shot.speaker)
         else:
@@ -811,6 +888,7 @@ def load_storyboard_from_json(data: Any, *, title: str = "AI_Movie", audio_mode:
             gen_mode=str(it.get("gen_mode", "")),
             first_frame=str(it.get("first_frame", "")),
             last_frame=str(it.get("last_frame", "")),
+            voice_over=bool(it.get("voice_over", False)),
         ))
     _assign_seeds(p)
     return p
