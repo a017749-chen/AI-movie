@@ -558,6 +558,23 @@ def _on_screen_line(project: StoryboardProject, beat: BeatSpec, pictures: List[P
     return f"On screen: {who}; nobody else."
 
 
+SPEECH_GUARD = ("Only the words inside <d>...</d> are ever spoken aloud. Everything else in this prompt is silent "
+                "direction: never voice it, never read it as narration and never show it as text on screen.")
+
+
+def spoken_text_report(project: StoryboardProject) -> str:
+    """Everything that will be voiced and subtitled, line by line - read it before spending GPU time."""
+    rows: List[str] = []
+    for s in project.shots:
+        units = [(b.beat_id, b.speaker, b.dialogue) for b in s.beats] if s.beats else [(s.shot_id, s.speaker, s.dialogue)]
+        for uid, speaker, text in units:
+            text = clean_dialogue(text)
+            if text:
+                ch = project.characters.get(speaker)
+                rows.append(f"   {uid:>6} | {(ch.name if ch else speaker or '旁白')} | {text}")
+    return "\n".join(rows) if rows else "   （整支影片沒有任何台詞）"
+
+
 def build_h3_prompt(project: StoryboardProject, shot: ShotSpec, pictures: List[PictureRef], *,
                     opening: Optional[bool] = None, end_picture: int = 0) -> str:
     """Compose the full H3 prompt for one clip. `pictures` must be the exact list fed to the graph.
@@ -678,6 +695,8 @@ def build_h3_prompt(project: StoryboardProject, shot: ShotSpec, pictures: List[P
 
     tail: List[str] = [project.continuity_rules] if pictures else []
     tail.append(project.negative_rules)
+    if native:
+        tail.append(SPEECH_GUARD)
     lines.append("integrated_multimodal_description: " + ("" if shot.beats else "[Shot 1] ")
                  + " ".join(x for x in body + action + tail if x))
     lines.append("")

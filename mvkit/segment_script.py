@@ -148,8 +148,10 @@ def parse_segment_script(text: str) -> List[_Draft]:
         if m:
             last = _LABEL_MAP[m.group(1).lower()]
             target[last] = (target.get(last, "") + " " + m.group(2).strip()).strip()
-        elif last:
-            target[last] = (target.get(last, "") + " " + body).strip()
+        elif last or target is not None:
+            from .script_import import route_stray_line
+            last, text = route_stray_line(body, last, target.get("dialogue", ""))
+            target[last] = (target.get(last, "") + " " + text).strip()
     return segs
 
 
@@ -227,10 +229,16 @@ def segments_to_project(segs: List[_Draft], *, title: str = "AI_Movie", audio_mo
             if re.fullmatch(r"\s*(無|none|n/?a|—|-)\s*", spoken or "", flags=re.I):
                 spoken = ""
             framing = b.get("framing", "") or _framing(b.get("_header", ""))
+            setting = "；".join(x for x in ((f.get("setting", "") if k == 1 else ""), b.get("setting", "")) if x)
+            if setting:               # 背景設定 is picture context only, never dialogue
+                b = dict(b, visual=f"{b.get('visual', '')}（背景：{setting}）".strip())
             lighting = b.get("lighting", "") or f.get("lighting", "")
             missing = [zh for key, zh in REQUIRED.items()
                        if not {"framing": framing, "lighting": lighting, "visual": b.get("visual", ""),
                                "dialogue": "dialogue" in b, "sound": sound}[key]]
+            from .script_import import speakers_in
+            if len(speakers_in(dialogue_raw)) > 1:
+                missing.append("一個分鏡只能有一位說話者（請把兩人的台詞拆成兩個分鏡）")
             cast = [c for c in re.split(r"[,;，；、/／\s]+", b.get("cast", "") or b.get("characters", "")) if c]
             beats.append(BeatSpec(beat_id=b.get("_id") or f"{sd.number}-{k}", duration_sec=sec, framing=framing,
                                   lighting=lighting, visual=b.get("visual", ""), dialogue=spoken, speaker=cue,
@@ -248,7 +256,7 @@ def segments_to_project(segs: List[_Draft], *, title: str = "AI_Movie", audio_mo
             dialogue="".join(b.dialogue for b in beats),
             subtitle_text="",
             characters=[c for c in re.split(r"[,;，；、\s]+", f.get("characters", "") or f.get("cast", "")) if c],
-            notes=heading,
+            notes="；".join(x for x in [heading, f.get("notes", "")] + [b.get("notes", "") for b in sd.beats] if x),
             beats=beats,
             gen_mode=mode,
             first_frame=f.get("first_frame", "").strip(),

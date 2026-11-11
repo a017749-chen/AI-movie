@@ -95,6 +95,8 @@ class ShotDraft:
     subtitle: str = ""
     refs: str = ""
     extra: List[str] = field(default_factory=list)
+    setting: str = ""                 # 背景設定 lines: picture context, never spoken
+    notes: str = ""                   # remarks / loose lines: kept for the reviewer only
 
 
 # ---------------------------------------------------------------------- reading files
@@ -176,12 +178,17 @@ def parse_freeform_script(text: str) -> List[ShotDraft]:
             value = m.group(2).strip()
             setattr(cur, last_field, (getattr(cur, last_field) + " " + value).strip())
         elif last_field:
-            setattr(cur, last_field, (getattr(cur, last_field) + " " + line).strip())
+            body = re.sub(r"^\s*[-*•·]\s*", "", line)
+            last_field, text = route_stray_line(body, last_field, cur.dialogue)
+            setattr(cur, last_field, (getattr(cur, last_field) + " " + text).strip())
         else:
             cur.extra.append(line)
     for d in drafts:
         d.dialogue, d.speaker_cue = split_dialogue(d.dialogue)
         d.visual = _tidy(d.visual or " ".join(d.extra))
+        if d.setting:
+            d.visual = _tidy(f"{d.visual}（背景：{d.setting}）")
+        d.scoring = "；".join(x for x in (d.scoring, d.notes) if x)
         d.scene, d.scoring, d.title = _tidy(d.scene), _tidy(d.scoring), _tidy(d.title)
     return drafts
 
@@ -189,6 +196,38 @@ def parse_freeform_script(text: str) -> List[ShotDraft]:
 def _tidy(s: str) -> str:
     s = re.sub(r"\s+([，。、；：！？）」])", r"\1", s or "")     # "洗手 。" -> "洗手。"
     return re.sub(r"\s{2,}", " ", s).strip()
+
+
+SETTING_WORDS = ("背景", "設定", "環境", "世界觀", "氛圍", "情境", "setting", "background")
+_OTHER_LABEL = re.compile(r"^([^\s：:「『（(|｜]{1,10})\s*[：:]\s*(.*)$")
+_OPEN_Q, _CLOSE_Q = "「『“", "」』”"
+
+
+def route_stray_line(body: str, last_field: str, current_dialogue: str) -> tuple:
+    """Where a line without a known label belongs: (field, text).
+
+    Only real continuations may extend the spoken line - an unfinished quote, or a new line that itself
+    opens with a quote / `（對病人）` / `考生：「…」`. Background notes (`背景設定：…`), remarks (`備註：…`)
+    and loose text after the dialogue never become dialogue: they would be voiced and subtitled.
+    """
+    m = _OTHER_LABEL.match(body)
+    quoted_speaker = bool(m and m.group(2).lstrip()[:1] in _OPEN_Q)
+    if m and not (last_field == "dialogue" and quoted_speaker):
+        if any(w in m.group(1).lower() for w in SETTING_WORDS):
+            return "setting", m.group(2).strip()
+        return "notes", body
+    if last_field == "dialogue":
+        open_quote = sum(current_dialogue.count(c) for c in _OPEN_Q) > sum(current_dialogue.count(c) for c in _CLOSE_Q)
+        starts_like_speech = body[:1] in _OPEN_Q + "（(" or quoted_speaker
+        if not (open_quote or starts_like_speech):
+            return "notes", body
+    return last_field or "notes", body
+
+
+def speakers_in(raw: str) -> List[str]:
+    """Names written before quotes: '考生：「…」 病人：「…」' -> ['考生', '病人']."""
+    found = re.findall(r"([^\s：:「『“」』”，。（）()]{1,8})\s*[：:]\s*[「『“]", raw or "")
+    return list(dict.fromkeys(found))
 
 
 def split_dialogue(raw: str) -> tuple:
@@ -201,12 +240,16 @@ def split_dialogue(raw: str) -> tuple:
     quotes = _QUOTE_RE.findall(raw)
     if quotes:
         line = "".join(q.strip() for q in quotes)
+        named = speakers_in(raw)
+        if not cue and named:
+            cue = named[0]
     else:
         line = _CUE_RE.sub("", raw)
         m = re.match(r"^\s*([^：:「]{1,8})[：:]\s*(.+)$", line)    # 考生：好，我們開始
         if m:
             cue = cue or m.group(1).strip()
             line = m.group(2)
+    line = re.sub("(?<=[　-鿿＀-￯])[ 	]+(?=[　-鿿＀-￯])", "", line)   # joined lines
     return _tidy(clean_dialogue(line)), cue
 
 
