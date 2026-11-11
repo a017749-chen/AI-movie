@@ -19,7 +19,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from .script_loader import StoryboardProject, clean_dialogue
+from .script_loader import StoryboardProject, clean_dialogue, speech_finish
+
+
+def decode_audio_16k(media_path: str | Path):
+    """Mono 16 kHz float32 samples via ffmpeg.
+
+    faster-whisper decodes files with PyAV; on Colab the two versions disagree
+    (`open() got an unexpected keyword argument 'metadata_errors'`) and every transcription fails.
+    Handing it the samples avoids PyAV altogether.
+    """
+    import numpy as np
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(media_path), "-vn", "-ac", "1", "-ar", "16000",
+                          "-f", "s16le", "-"], capture_output=True, check=True).stdout
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
 
 @dataclass
@@ -109,6 +122,7 @@ def build_cues_from_storyboard(
         return cues
 
     cursor = 0.0
+    native = project.audio_mode == "native_h3_audio"
     for idx, shot in enumerate(project.shots):
         dur = (
             float(clip_durations[idx])
@@ -129,6 +143,8 @@ def build_cues_from_storyboard(
                 if b_clauses:
                     u0 = b_start + min(0.3, b.duration_sec * 0.1)
                     u1 = max(u0 + 0.4, b_end - min(0.2, b.duration_sec * 0.1))
+                    if native:                    # the line ends long before a long 分鏡 does
+                        u1 = speech_finish(u0, u1, b.dialogue)
                     total_w = sum(max(2, len(c)) for c in b_clauses)
                     t_cur = u0
                     for i_c, clause in enumerate(b_clauses):
@@ -149,6 +165,8 @@ def build_cues_from_storyboard(
 
         usable_start = shot_start + min(lead_in_sec, dur * 0.1)
         usable_end = max(usable_start + 0.4, shot_end - min(tail_pad_sec, dur * 0.1))
+        if native:
+            usable_end = speech_finish(usable_start + 0.3, usable_end, raw_text)
         usable_span = max(0.4, usable_end - usable_start)
 
         total_weight = sum(max(2, len(c)) for c in clauses)
@@ -193,7 +211,7 @@ def align_cues_with_asr(
         model = WhisperModel(model_size, device=device, compute_type=compute_type)
         prompt_text = "，".join(c.text for c in cues)
         segments, _ = model.transcribe(
-            str(audio_or_video_path),
+            decode_audio_16k(audio_or_video_path),
             language="zh",
             initial_prompt=prompt_text[:220],
             word_timestamps=True,

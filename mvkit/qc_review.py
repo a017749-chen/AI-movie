@@ -121,6 +121,12 @@ def similarity(expected: str, heard: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+def _says_more(expected: str, heard: str) -> bool:
+    """The scripted line is there, followed (or preceded) by clearly more speech than was written."""
+    e, h = normalise_text(expected), normalise_text(heard)
+    return bool(e) and len(h) > len(e) * 1.3 + 4
+
+
 def _beat_windows(shot: ShotSpec) -> List[Tuple[float, float]]:
     out, t = [], 0.0
     for b in shot.beats:
@@ -211,7 +217,8 @@ def check_reference_images(project: StoryboardProject, base_dirs: Optional[Seque
 # ---------------------------------------------------------------------- speech
 def transcribe_words(clip: str | Path, model, prompt: str = "") -> List[Tuple[float, float, str]]:
     """[(start, end, word)] from faster-whisper (word timestamps)."""
-    segments, _ = model.transcribe(str(clip), language="zh", initial_prompt=prompt[:220] or None,
+    from .subtitles import decode_audio_16k
+    segments, _ = model.transcribe(decode_audio_16k(clip), language="zh", initial_prompt=prompt[:220] or None,
                                    word_timestamps=True, vad_filter=True, beam_size=5)
     words: List[Tuple[float, float, str]] = []
     for seg in segments:
@@ -232,6 +239,8 @@ def speech_issues(project: StoryboardProject, shot: ShotSpec, words: Iterable[Tu
     if not beats:                                   # one-cut shot: the whole clip is one window
         heard = "".join(w for _, _, w in words)
         exp = clean_dialogue(shot.dialogue)
+        if exp and _says_more(exp, heard):
+            return [f"{shot.shot_id}: 台詞之外還多說了話。聽到「{heard}」，腳本只有「{exp}」"]
         if exp and similarity(exp, heard) < min_similarity:
             return [f"{shot.shot_id}: 台詞不符（相似度 {similarity(exp, heard):.0%}）聽到「{heard or '（無）'}」"]
         if not exp and len(normalise_text(heard)) >= 3:
@@ -244,6 +253,9 @@ def speech_issues(project: StoryboardProject, shot: ShotSpec, words: Iterable[Tu
         heard = "".join(w for s, e, w in words if t0 - slack <= (s + e) / 2 < t1 + slack)
         exp = clean_dialogue(b.dialogue)
         if exp:
+            if _says_more(exp, heard):
+                issues.append(f"分鏡 {b.beat_id}: 台詞之外還多說了話。聽到「{heard}」，腳本只有「{exp}」")
+                continue
             sim = similarity(exp, heard)
             if sim >= min_similarity:
                 continue

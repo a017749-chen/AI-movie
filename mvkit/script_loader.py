@@ -272,6 +272,59 @@ def clean_dialogue(text: str) -> str:
 # kept for backwards compatibility with earlier imports
 _clean_dialogue_tags = clean_dialogue
 
+# Sentences that TELL the model what to do ("never duplicate him", "不要其他人聲") instead of describing a look
+# or a sound. H3 treats everything in the prompt as content: such sentences were read aloud by the narrator
+# and the things they forbid ("no added staff") showed up in the picture. They never reach the prompt.
+_INSTRUCTION = re.compile(
+    r"^\s*(?:please\s+)?(?:follow|show\s|use\s|keep\s|avoid|ensure|make sure|do not|don't|never|no\s|"
+    r"each (?:character )?reference)|\b(?:never|do not|don't|must not)\b|"
+    r"不要|請勿|避免|禁止|切勿|務必|不得|不可", re.I)
+_SPEECH_WORDS = re.compile(r"旁白|台詞|對白|人聲|說出|說話|只說|開口|口述|保持安靜|唸|narrat|speak|spoken|dialogue|〔台詞〕",
+                           re.I)
+SPEECH_CHARS_PER_SEC = 4.3           # measured on generated clips: 40 characters took 9.5 s
+
+
+def split_directions(text: str, *, clauses: bool = False) -> Tuple[str, List[str]]:
+    """(kept, dropped) - `kept` only describes; `dropped` are instruction sentences.
+
+    clauses=True is for the 音效 field: split at commas too and also drop anything about who talks or stays
+    quiet (the prompt builder states the speech rules itself, in English, from the 旁白對白 field).
+    """
+    if not text or not text.strip():
+        return "", []
+    src = text.strip()
+    if clauses:
+        src = re.sub(r"[「『“][^」』”]*[」』”]", "〔台詞〕", src)      # a quoted line never belongs in a sound note
+    pattern = r"(?<=[。；;！!？?])\s*|(?<=\.)\s+" + (r"|(?<=[，,])\s*" if clauses else "")
+    kept: List[str] = []
+    dropped: List[str] = []
+    for part in re.split(pattern, src):
+        part = part.strip()
+        if not part.strip(" .。；;，,"):
+            continue
+        bad = _INSTRUCTION.search(part) or (clauses and _SPEECH_WORDS.search(part))
+        (dropped if bad else kept).append(part)
+    out = re.sub(r"([。；！？，])\s+", r"\1", " ".join(kept)).strip()
+    return out, [d.strip(" .。；;，,") for d in dropped]
+
+
+def describe_only(text: str) -> str:
+    return split_directions(text)[0].rstrip(" .。")
+
+
+def speech_seconds(text: str) -> float:
+    """How long a line takes to say at the pace H3 speaks Mandarin."""
+    t = clean_dialogue(text)
+    n = len(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", t))
+    if not n:
+        return 0.0
+    return round(n / SPEECH_CHARS_PER_SEC + 0.2 * len(re.findall(r"[，。、；：！？,.!?;:]", t)), 1)
+
+
+def speech_finish(start: float, limit: float, spoken: str) -> float:
+    """When the line should be over: its own length plus a margin, never past the window's limit."""
+    return round(max(start + 0.8, min(limit, start + speech_seconds(spoken) * 1.1 + 0.5)), 1)
+
 
 def _resolve_path(p: str, base_dirs: List[Path]) -> str:
     """Find `p` in `base_dirs`, tolerating case differences and AI-image extension swaps (.png/.jpg/.webp)."""
@@ -409,10 +462,11 @@ def shot_picture_plan(project: StoryboardProject, shot: ShotSpec,
 
 def _character_label(ch: CharacterSpec) -> str:
     bits = [ch.name]
-    if ch.description:
-        bits.append(ch.description)
-    if ch.screen_position:
-        bits.append(f"always in the same place ({ch.screen_position})")
+    looks, place = describe_only(ch.description), describe_only(ch.screen_position)
+    if looks:
+        bits.append(looks)
+    if place:
+        bits.append(f"always in the same place ({place})")
     return ", ".join(bits)
 
 
@@ -473,23 +527,33 @@ def _music_from(sound: str) -> str:
 def _ambient(sound: str) -> str:
     """Sound effects only; the 配樂 part goes to non_diegetic_music."""
     s = re.sub(r"[；;，,]?\s*(?:配樂|音樂|music)\s*[：:]?[^；;。\n]*", "", sound or "", flags=re.I)
-    return s.strip(" ；;，,。.")
+    s = re.sub(r"(?:^|(?<=[；;。，,\s]))(?:音效|sound(?:\s*effects?)?)\s*[：:]\s*", "", s, flags=re.I)
+    kept = split_directions(s, clauses=True)[0]
+    # plain room tone is already in overall_soundscape (in English); H3 read "僅低音量診間底噪" aloud
+    effects = [x.strip() for x in re.split(r"[；;。，,、]", kept)
+               if x.strip() and not re.search(r"環境音|底噪|背景音|room tone|ambien", x, flags=re.I)]
+    return "、".join(effects)
+
+
+QUIET_AFTER = (" The line is said once. After it nobody speaks again until this shot ends: no narration, "
+               "no repeated or additional words, only room tone.")
 
 
 def _speech(project: StoryboardProject, speaker: str, spoken: str, start: float, finish: float,
-            pictures: List[PictureRef], *, voice_over: bool = False) -> str:
+            pictures: List[PictureRef], *, voice_over: bool = False, quiet_after: bool = False) -> str:
     when = f"starting at {start:.1f} seconds and finishing by {finish:.1f} seconds"
+    quiet = QUIET_AFTER if quiet_after else ""
     if speaker and not voice_over:
         return (f"{_speaker_phrase(project, speaker, pictures)} says, {when}: <d>[Chinese] {spoken}</d> "
-                f"Only this person's lips move; everyone else keeps their mouth closed.")
+                f"Only this person's lips move; everyone else keeps their mouth closed.{quiet}")
     if speaker:
         ch = project.characters.get(speaker)
         name = ch.name if ch else speaker
         voice = f", voice: {ch.voice}" if ch and ch.voice else ""
         return (f"Voice-over by {name}, whose face is not visible in this shot{voice}, {when}: "
-                f"<d>[Chinese] {spoken}</d> Nobody on screen moves their lips.")
+                f"<d>[Chinese] {spoken}</d> Nobody on screen moves their lips.{quiet}")
     return (f"{project.narrator}, {when}: <d>[Chinese] {spoken}</d> "
-            f"The on-screen people do not speak; their lips stay relaxed.")
+            f"The on-screen people do not speak; their lips stay relaxed.{quiet}")
 
 
 def _voices_line(project: StoryboardProject, speakers: List[str]) -> str:
@@ -575,6 +639,49 @@ def spoken_text_report(project: StoryboardProject) -> str:
     return "\n".join(rows) if rows else "   （整支影片沒有任何台詞）"
 
 
+def prompt_hygiene_report(project: StoryboardProject) -> List[str]:
+    """What was kept out of the prompt, and lines much shorter than their 分鏡 - read before generating."""
+    def short(parts: List[str]) -> str:
+        text = "｜".join(parts)
+        return text if len(text) <= 90 else text[:88] + "…"
+
+    notes: List[str] = []
+    for sid, sc in project.scenes.items():
+        dropped = split_directions(sc.description)[1]
+        if dropped:
+            notes.append(f"場景 {sid} 的描述有 {len(dropped)} 句是指令（不是環境的樣子），不會送給模型：{short(dropped)}")
+    for cid, ch in project.characters.items():
+        dropped = split_directions(ch.description)[1] + split_directions(ch.screen_position)[1]
+        if dropped:
+            notes.append(f"角色 {cid} 的外觀／位置有 {len(dropped)} 句是指令，不會送給模型：{short(dropped)}")
+    by_text: Dict[str, List[str]] = {}
+    for s in project.shots:
+        for b in s.beats:
+            raw = re.sub(r"[；;，,]?\s*(?:配樂|音樂|music)\s*[：:]?[^；;。\n]*", "", b.sound or "", flags=re.I)
+            raw = re.sub(r"(?:^|(?<=[；;。，,\s]))(?:音效|sound(?:\s*effects?)?)\s*[：:]\s*", "", raw, flags=re.I)
+            dropped = split_directions(raw, clauses=True)[1]
+            if dropped:
+                by_text.setdefault(short(dropped), []).append(b.beat_id)
+    for text, ids in by_text.items():
+        notes.append(f"分鏡 {'、'.join(ids)} 的音效欄寫了「誰說話／保持安靜／不要…」這類指示，不會送給模型"
+                     f"（這種句子會被旁白唸出來）：{text}")
+    if project.audio_mode == "native_h3_audio":
+        for s in project.shots:
+            single = len(s.beats) <= 1
+            units = [(f"分鏡 {b.beat_id}", b.dialogue, b.duration_sec) for b in s.beats] if s.beats \
+                else [(f"段落 {s.shot_id}", s.dialogue, s.duration_sec)]
+            for uid, text, window in units:
+                est = speech_seconds(text)
+                if not est:
+                    continue
+                idle = window - (est * 1.1 + 0.8)
+                if idle > 3.0:
+                    need = max(H3_STABLE_MIN_SECONDS if single else 2.0, math.ceil(est * 1.1 + 1.5))
+                    notes.append(f"{uid}：台詞約 {est:.1f} 秒，卻排了 {window:g} 秒，有 {idle:.0f} 秒沒人說話，"
+                                 f"H3 容易自己補話。建議縮到約 {need:g} 秒，或讓畫面在這段時間有動作")
+    return notes
+
+
 def build_h3_prompt(project: StoryboardProject, shot: ShotSpec, pictures: List[PictureRef], *,
                     opening: Optional[bool] = None, end_picture: int = 0) -> str:
     """Compose the full H3 prompt for one clip. `pictures` must be the exact list fed to the graph.
@@ -633,8 +740,8 @@ def build_h3_prompt(project: StoryboardProject, shot: ShotSpec, pictures: List[P
 
     body: List[str] = []
     scene = project.scenes.get(shot.scene_id) or project.scenes.get("default")
-    if scene and scene.description:
-        body.append(f"Setting: {scene.description}.")
+    if scene and describe_only(scene.description):
+        body.append(f"Setting: {describe_only(scene.description)}.")
     pictured = {p.char_id for p in pictures if p.char_id}
     for cid in shot.characters:
         ch = project.characters.get(cid)
@@ -660,19 +767,22 @@ def build_h3_prompt(project: StoryboardProject, shot: ShotSpec, pictures: List[P
                 parts.append(b.visual.strip().rstrip("。.") + ".")
             if b.camera:
                 parts.append(f"Camera: {b.camera.strip().rstrip('。.')}.")
+            ambient = _ambient(b.sound)
+            if native and ambient:
+                parts.append(f"Sound: {ambient}.")
             spoken = clean_dialogue(b.dialogue)
             if native and spoken:
                 finish = t + b.duration_sec - 0.3
                 if k == len(shot.beats):         # leave the silent last second
                     finish = min(finish, seconds - 1.0)
-                parts.append(_speech(project, b.speaker, spoken, t + 0.3, max(t + 0.8, finish), pictures,
-                                     voice_over=b.voice_over))
+                # a short line in a long 分鏡 leaves dead air that H3 fills by reading the prompt aloud
+                finish = speech_finish(t + 0.3, max(t + 0.8, finish), spoken)
+                parts.append(_speech(project, b.speaker, spoken, t + 0.3, finish, pictures,
+                                     voice_over=b.voice_over,
+                                     quiet_after=t + b.duration_sec - finish > 1.2))
                 speakers.append(b.speaker)
             elif native:
                 parts.append("No one speaks in this shot; all mouths stay closed.")
-            ambient = _ambient(b.sound)
-            if native and ambient:
-                parts.append(f"Sound: {ambient}.")
             action.append(" ".join(parts))
             t += b.duration_sec
         if not native:
@@ -686,8 +796,9 @@ def build_h3_prompt(project: StoryboardProject, shot: ShotSpec, pictures: List[P
             action.append(f"Camera: {shot.camera_motion.strip().rstrip('。.')}.")
         spoken = clean_dialogue(shot.dialogue)
         if native and spoken:
-            action.append(_speech(project, shot.speaker, spoken, 0.4, max(1.5, seconds - 1.0), pictures,
-                                  voice_over=shot.voice_over))
+            finish = speech_finish(0.4, max(1.5, seconds - 1.0), spoken)
+            action.append(_speech(project, shot.speaker, spoken, 0.4, finish, pictures,
+                                  voice_over=shot.voice_over, quiet_after=seconds - finish > 2.2))
             action.append("Hold the final pose silently for the last second.")
             speakers.append(shot.speaker)
         else:
